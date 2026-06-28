@@ -1,0 +1,4 @@
+name: unified
+version: "0.1.0"
+description: "Hermes unified reflexion memory provider with scoped recall and backup support."
+author: Arena.ai integration layer

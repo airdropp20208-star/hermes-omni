@@ -1,0 +1,9 @@
+name: unified_core
+version: "0.2.0"
+description: "Compatibility plugin for the core-integrated Hermes unified layer: event bus helpers and optional tracing middleware."
+author: Arena.ai integration layer
+hooks:
+  - on_session_start
+  - transform_llm_output
+middleware:
+  - tool_execution
