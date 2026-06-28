@@ -58,6 +58,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
+from agent.omni_integration import OmniFeatureGate
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -586,6 +587,17 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+    # ── OmniAgent Features (Deep Reflexion + Guardian + Sentinel + Evolution) ──
+    try:
+        _omni_gate = OmniFeatureGate(
+            work_dir=getattr(agent, 'work_dir', None) or Path.cwd(),
+            enabled=True,
+        )
+        _omni_gate.on_turn_start(user_message)
+    except Exception as _omni_exc:
+        logger.debug("omni_gate_init_failed: %s", _omni_exc)
+        _omni_gate = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -4228,7 +4240,34 @@ def run_conversation(
                     except Exception:
                         pass
 
+                # ── OmniAgent: Pre-execution check (Guardian + Reflexion) ──
+                if _omni_gate:
+                    for _tc in assistant_message.tool_calls:
+                        _tc_name = _tc.function.name
+                        try:
+                            _tc_params = json.loads(_tc.function.arguments) if _tc.function.arguments else {}
+                        except (json.JSONDecodeError, TypeError):
+                            _tc_params = {}
+                        _omni_warning = _omni_gate.before_tool_call(_tc_name, _tc_params)
+                        if _omni_warning and "BLOCKED" in _omni_warning:
+                            logger.warning("omni_guardian_blocked tool=%s", _tc_name)
+                            # Inject as tool error so model can recover
+                            messages.append({
+                                "role": "tool",
+                                "name": _tc_name,
+                                "tool_call_id": _tc.id,
+                                "content": _omni_warning,
+                            })
+                            # Skip execution of this tool
+                            continue
+
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # ── OmniAgent: Post-execution check (Reflexion error detection) ──
+                if _omni_gate:
+                    for _msg in messages[-len(assistant_message.tool_calls):]:
+                        if isinstance(_msg, dict) and _msg.get("role") == "tool":
+                            _omni_gate.after_tool_call(_msg.get("name", ""), _msg.get("content", ""))
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -4780,6 +4819,24 @@ def run_conversation(
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
     )
+
+    # ── OmniAgent: Post-turn hooks (Context Evolution + stats) ──
+    if _omni_gate:
+        if failed:
+            try:
+                await _omni_gate.on_turn_failure(
+                    user_message,
+                    _turn_exit_reason,
+                    conversation_history,
+                )
+            except Exception as _omni_exc:
+                logger.debug("omni_turn_failure_hook_failed: %s", _omni_exc)
+        # Auto-promote learned lessons
+        if _omni_gate.evolution:
+            try:
+                _omni_gate.evolution.auto_promote_lessons()
+            except Exception:
+                pass
 
 
 
