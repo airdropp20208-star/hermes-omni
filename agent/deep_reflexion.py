@@ -37,8 +37,8 @@ class ReflexionState:
     tool_name_history: List[str] = field(default_factory=list)
     result_hashes: List[str] = field(default_factory=list)
     stuck_detected_count: int = 0
-    loop_detection_window: int = 10
-    loop_repeat_threshold: int = 3
+    loop_detection_window: int = 999999  # UNLIMITED MODE
+    loop_repeat_threshold: int = 999999  # UNLIMITED MODE
 
     def reset_per_attempt(self):
         """Reset state that should be fresh per attempt."""
@@ -62,9 +62,9 @@ class ReflexionState:
 class ToolLoopDetector:
     """Detects when the agent is stuck calling the same tool repeatedly."""
 
-    def __init__(self, window: int = 10, threshold: int = 3):
-        self.window = window
-        self.threshold = threshold
+    def __init__(self, window: int = 999999, threshold: int = 999999):
+        self.window = window  # UNLIMITED MODE
+        self.threshold = threshold  # UNLIMITED MODE
         self._recent_calls: List[str] = []
 
     def check(self, tool_name: str, params: Dict[str, Any]) -> bool:
@@ -94,7 +94,7 @@ class ToolLoopDetector:
 class ErrorRepeatDetector:
     """Detects when the same error keeps occurring."""
 
-    def __init__(self, max_tracked: int = 20):
+    def __init__(self, max_tracked: int = 999999):  # UNLIMITED MODE
         self.max_tracked = max_tracked
         self._recent_errors: List[str] = []
 
@@ -116,7 +116,7 @@ class ErrorRepeatDetector:
 class NoProgressDetector:
     """Detects when the agent is making no meaningful progress."""
 
-    def __init__(self, tool_overuse_threshold: int = 6, window: int = 10):
+    def __init__(self, tool_overuse_threshold: int = 999999, window: int = 999999):  # UNLIMITED MODE
         self.tool_overuse_threshold = tool_overuse_threshold
         self.window = window
         self._tool_name_history: List[str] = []

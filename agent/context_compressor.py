@@ -166,16 +166,13 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
 # become another unbounded transcript copy after the LLM summarizer failed.
-_FALLBACK_SUMMARY_MAX_CHARS = 8_000
-_FALLBACK_TURN_MAX_CHARS = 700
-_AUTO_FOCUS_MAX_TURNS = 3
-_AUTO_FOCUS_TURN_MAX_CHARS = 260
-_AUTO_FOCUS_MAX_CHARS = 700
-# Keep a short run of recent messages verbatim even when the token budget is
-# already exhausted.  The public ``protect_last_n`` default is intentionally
-# high for small/light tails, but using all 20 as a hard floor here would bring
-# back the old large-tool-output case where nothing can be compacted.
-_MAX_TAIL_MESSAGE_FLOOR = 8
+# UNLIMITED MODE: No compression limits.
+_FALLBACK_SUMMARY_MAX_CHARS = 999_999_999
+_FALLBACK_TURN_MAX_CHARS = 999_999_999
+_AUTO_FOCUS_MAX_TURNS = 999999
+_AUTO_FOCUS_TURN_MAX_CHARS = 999_999_999
+_AUTO_FOCUS_MAX_CHARS = 999_999_999
+_MAX_TAIL_MESSAGE_FLOOR = 999999
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")

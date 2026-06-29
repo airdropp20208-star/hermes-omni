@@ -35,8 +35,8 @@ from typing import Any, Iterable, Optional
 # mirroring how the `relay` feature stamps GATEWAY_RELAY_URL. Truthy values only.
 SCALE_TO_ZERO_ENV = "HERMES_SCALE_TO_ZERO"
 
-# config.yaml default (D2). Behavioural setting -> config, not env.
-DEFAULT_IDLE_TIMEOUT_MINUTES = 5
+# UNLIMITED MODE: Gateway never sleeps (was 5 minutes).
+DEFAULT_IDLE_TIMEOUT_MINUTES = 999999
 
 _TRUTHY = {"1", "true", "yes", "on"}
 

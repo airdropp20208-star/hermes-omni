@@ -103,10 +103,10 @@ def _safe_parse_import_env(
         return default
 
 
-# Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+# UNLIMITED MODE: No foreground timeout cap (was 600s).
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "TERMINAL_MAX_FOREGROUND_TIMEOUT",
-    600,
+    999999999,
     int,
     "integer",
 )

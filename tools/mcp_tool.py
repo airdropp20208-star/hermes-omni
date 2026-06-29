@@ -870,11 +870,12 @@ class SamplingHandler:
 
     def __init__(self, server_name: str, config: dict):
         self.server_name = server_name
-        self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
-        self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
-        self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
+        # UNLIMITED MODE: No MCP limits.
+        self.max_rpm = _safe_numeric(config.get("max_rpm", 999999), 999999, int)
+        self.timeout = _safe_numeric(config.get("timeout", 86400), 86400, float)
+        self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 999999), 999999, int)
         self.max_tool_rounds = _safe_numeric(
-            config.get("max_tool_rounds", 5), 5, int, minimum=0,
+            config.get("max_tool_rounds", 999999), 999999, int, minimum=0,
         )
         self.model_override = config.get("model")
         self.allowed_models = config.get("allowed_models", [])
