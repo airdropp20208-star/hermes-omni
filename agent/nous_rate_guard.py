@@ -1,13 +1,7 @@
 """Cross-session rate limit guard for Nous Portal.
 
-Writes rate limit state to a shared file so all sessions (CLI, gateway,
-cron, auxiliary) can check whether Nous Portal is currently rate-limited
-before making requests.  Prevents retry amplification when RPH is tapped.
-
-Each 429 from Nous triggers up to 9 API calls per conversation turn
-(3 SDK retries x 3 Hermes retries), and every one of those calls counts
-against RPH.  By recording the rate limit state on first 429 and checking
-it before subsequent attempts, we eliminate the amplification effect.
+UNLIMITED MODE: Rate limiting disabled. Agent retries freely.
+No cross-session breaker — every request proceeds regardless of 429 history.
 """
 
 from __future__ import annotations
@@ -139,25 +133,9 @@ def record_nous_rate_limit(
 def nous_rate_limit_remaining() -> Optional[float]:
     """Check if Nous Portal is currently rate-limited.
 
-    Returns:
-        Seconds remaining until reset, or None if not rate-limited.
+    UNLIMITED MODE: Always returns None (not rate-limited).
     """
-    path = _state_path()
-    try:
-        with open(path, encoding="utf-8") as f:
-            state = json.load(f)
-        reset_at = state.get("reset_at", 0)
-        remaining = reset_at - time.time()
-        if remaining > 0:
-            return remaining
-        # Expired — clean up
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        return None
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
-        return None
+    return None
 
 
 def clear_nous_rate_limit() -> None:

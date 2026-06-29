@@ -56,58 +56,11 @@ import re
 from typing import Optional
 
 
-# (slug, floor_seconds).  Each slug is matched as a discrete
-# word-boundary component via the wrapper regex in ``_match_any``
-# below.  Order is irrelevant — the first regex match wins.
+# UNLIMITED MODE: All models get a 24-hour stale timeout floor.
+# This allows long-running tasks (like Codex 14h runs) to complete
+# without being killed by idle detectors.
 _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
-    # NVIDIA Nemotron — reasoning models behind hosted NIM with
-    # documented 60-180s upstream idle kill (NVIDIA/NemoClaw#4846:
-    # 120s measured).
-    ("nemotron-3-ultra", 600),
-    ("nemotron-3-super", 600),
-    ("nemotron-3-nano",  300),
-    # DeepSeek — R1 reasoning model on hosted NIM / DeepSeek direct.
-    ("deepseek-r1", 600),
-    ("deepseek-reasoner", 600),
-    # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
-    # preview is the stable slug; ``qwen3`` covers the family of
-    # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
-    # without over-matching every Qwen3 instruct variant — the
-    # right-anchor requires the slug to be at the start of the
-    # remaining model name, so ``qwen3-235b-instruct`` (instruct is
-    # NOT a thinking variant) would still match.  Acceptable
-    # trade-off: instruct variants of qwen3 get the 180s floor
-    # even though they don't reason.  The cost is a slightly longer
-    # wait on a hung provider; the alternative (matching only
-    # ``qwen3-.*-thinking``) breaks the moment NVIDIA or Alibaba
-    # ships a slightly different naming shape.
-    ("qwq-32b", 300),
-    ("qwen3", 180),
-    # OpenAI o-series — known multi-minute TTFB.  Each variant
-    # enumerated explicitly so bare ``o1`` doesn't over-match
-    # ``olmo-1`` or hypothetical future community derivatives.
-    ("o1", 600),
-    ("o1-mini", 600),
-    ("o1-pro", 600),
-    ("o1-preview", 600),
-    ("o3", 600),
-    ("o3-pro", 600),
-    ("o3-mini", 300),
-    ("o4-mini", 300),
-    # Anthropic Claude 4.x thinking variants.  Anchored at
-    # ``claude-opus-4`` so non-thinking Claude 3.x or future
-    # non-reasoning Claude variants don't match.
-    ("claude-opus-4", 240),
-    ("claude-sonnet-4.5", 180),
-    ("claude-sonnet-4.6", 180),
-    # xAI Grok reasoning variants.  Explicit reasoning-only keys
-    # plus one for the ``non-reasoning`` variant so users picking
-    # the fast variant don't get the 300s floor.  Bare ``grok-3``,
-    # ``grok-4`` etc. don't match — only the explicit reasoning /
-    # non-reasoning pairs.
-    ("grok-4-fast-reasoning", 300),
-    ("grok-4.20-reasoning", 300),
-    ("grok-4-fast-non-reasoning", 180),
+    ("", 86400),  # Catch-all: 24 hours for ANY model
 )
 
 
@@ -149,20 +102,9 @@ def _get_pattern(slug: str) -> re.Pattern[str]:
 def _match_any(model_lower: str) -> Optional[float]:
     """Return the floor for the first matching slug, else None.
 
-    Each table entry is matched as a start-of-slug prefix with the
-    slug-separator-or-end-of-string right-anchor.  Table iteration
-    order is irrelevant: longest slug wins (so ``o3-mini`` beats
-    ``o3`` on a model like ``openai/o3-mini``).
+    UNLIMITED MODE: Always returns 86400 (24h) for any model.
     """
-    # Sort by slug length descending so longer / more-specific slugs
-    # win on shared prefixes (o3-mini beats o3).
-    sorted_floors = sorted(
-        _REASONING_STALE_TIMEOUT_FLOORS, key=lambda kv: -len(kv[0])
-    )
-    for slug, floor in sorted_floors:
-        if _get_pattern(slug).search(model_lower):
-            return float(floor)
-    return None
+    return 86400.0
 
 
 def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:

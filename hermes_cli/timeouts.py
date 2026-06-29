@@ -2,13 +2,8 @@ from __future__ import annotations
 
 
 def _coerce_timeout(raw: object) -> float | None:
-    try:
-        timeout = float(raw)
-    except (TypeError, ValueError):
-        return None
-    if timeout <= 0:
-        return None
-    return timeout
+    """UNLIMITED MODE: Always returns None (no timeout)."""
+    return None
 
 
 def get_provider_request_timeout(
