@@ -140,6 +140,30 @@ class UnifiedConfig:
     output_formatter_enabled: bool = False
     output_formatter_summarize_long: bool = False
     output_formatter_summarize_threshold: int = 8000
+    # --- v3 cognitive extensions (phases 1-5) ---
+    # Verifier: self-verification loop (critique → revise → re-critique).
+    # Catches hallucinations, logical errors, factual mistakes.
+    verifier_enabled: bool = False
+    verifier_max_iterations: int = 3
+    verifier_pass_threshold: float = 0.7
+    # Constitution: value alignment layer. User defines principles in
+    # ~/.hermes/constitution.md. Verifier checks alignment too.
+    constitution_enabled: bool = False
+    # SlowThinking: multi-level deep reasoning (fast/balanced/deep/max).
+    # The biggest differentiator for math/code/analysis quality.
+    slow_thinking_enabled: bool = False
+    slow_thinking_default_level: str = "fast"  # fast/balanced/deep/max
+    slow_thinking_store_traces: bool = False
+    # Ensemble: multi-model reasoning + LLM judge. Runs N models in
+    # parallel for hard tasks, judge picks/synthesizes.
+    ensemble_enabled: bool = False
+    ensemble_max_workers: int = 5
+    ensemble_timeout_seconds: float = 60.0
+    # CapabilityResolver: auto-install/create missing tools+MCPs.
+    # Agent never gets stuck on "missing tool" — installs or generates.
+    capability_resolver_enabled: bool = False
+    capability_resolver_auto_approve: bool = False  # DANGER: if true, no user prompt
+    capability_resolver_allow_network: bool = True
 
 
 _CONFIG_CACHE: UnifiedConfig | None = None
@@ -445,6 +469,78 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
     except Exception:
         output_formatter_summarize_threshold = 8000
 
+    # --- v3 cognitive extensions config ---
+    verifier_enabled = _truthy(
+        _cfg_get("unified", "verifier", "enabled", default=False), default=False
+    )
+    env_ver = _falsey_env("HERMES_UNIFIED_VERIFIER")
+    if env_ver is not None:
+        verifier_enabled = env_ver
+    try:
+        verifier_max_iterations = int(
+            _cfg_get("unified", "verifier", "max_iterations", default=3) or 3
+        )
+    except Exception:
+        verifier_max_iterations = 3
+    try:
+        verifier_pass_threshold = float(
+            _cfg_get("unified", "verifier", "pass_threshold", default=0.7) or 0.7
+        )
+    except Exception:
+        verifier_pass_threshold = 0.7
+
+    constitution_enabled = _truthy(
+        _cfg_get("unified", "constitution", "enabled", default=False), default=False
+    )
+    env_const = _falsey_env("HERMES_UNIFIED_CONSTITUTION")
+    if env_const is not None:
+        constitution_enabled = env_const
+
+    slow_thinking_enabled = _truthy(
+        _cfg_get("unified", "slow_thinking", "enabled", default=False), default=False
+    )
+    env_st = _falsey_env("HERMES_UNIFIED_SLOW_THINKING")
+    if env_st is not None:
+        slow_thinking_enabled = env_st
+    slow_thinking_default_level = str(
+        _cfg_get("unified", "slow_thinking", "default_level", default="fast") or "fast"
+    )
+    slow_thinking_store_traces = _truthy(
+        _cfg_get("unified", "slow_thinking", "store_traces", default=False), default=False
+    )
+
+    ensemble_enabled = _truthy(
+        _cfg_get("unified", "ensemble", "enabled", default=False), default=False
+    )
+    env_ens = _falsey_env("HERMES_UNIFIED_ENSEMBLE")
+    if env_ens is not None:
+        ensemble_enabled = env_ens
+    try:
+        ensemble_max_workers = int(
+            _cfg_get("unified", "ensemble", "max_workers", default=5) or 5
+        )
+    except Exception:
+        ensemble_max_workers = 5
+    try:
+        ensemble_timeout_seconds = float(
+            _cfg_get("unified", "ensemble", "timeout_seconds", default=60.0) or 60.0
+        )
+    except Exception:
+        ensemble_timeout_seconds = 60.0
+
+    capability_resolver_enabled = _truthy(
+        _cfg_get("unified", "capability_resolver", "enabled", default=False), default=False
+    )
+    env_cr = _falsey_env("HERMES_UNIFIED_CAPABILITY_RESOLVER")
+    if env_cr is not None:
+        capability_resolver_enabled = env_cr
+    capability_resolver_auto_approve = _truthy(
+        _cfg_get("unified", "capability_resolver", "auto_approve", default=False), default=False
+    )
+    capability_resolver_allow_network = _truthy(
+        _cfg_get("unified", "capability_resolver", "allow_network", default=True), default=True
+    )
+
     _CONFIG_CACHE = UnifiedConfig(
         enabled=enabled,
         reflexion_enabled=reflexion_enabled,
@@ -496,5 +592,18 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         output_formatter_enabled=output_formatter_enabled,
         output_formatter_summarize_long=output_formatter_summarize_long,
         output_formatter_summarize_threshold=output_formatter_summarize_threshold,
+        verifier_enabled=verifier_enabled,
+        verifier_max_iterations=verifier_max_iterations,
+        verifier_pass_threshold=verifier_pass_threshold,
+        constitution_enabled=constitution_enabled,
+        slow_thinking_enabled=slow_thinking_enabled,
+        slow_thinking_default_level=slow_thinking_default_level,
+        slow_thinking_store_traces=slow_thinking_store_traces,
+        ensemble_enabled=ensemble_enabled,
+        ensemble_max_workers=ensemble_max_workers,
+        ensemble_timeout_seconds=ensemble_timeout_seconds,
+        capability_resolver_enabled=capability_resolver_enabled,
+        capability_resolver_auto_approve=capability_resolver_auto_approve,
+        capability_resolver_allow_network=capability_resolver_allow_network,
     )
     return _CONFIG_CACHE

@@ -67,6 +67,42 @@ from .output_formatter import (
     format_output_for_platform,
     get_formatter,
 )
+# v3 cognitive extensions (phases 1-5)
+from .verifier import Verifier, VerificationResult, configure_verifier, get_verifier, verify_response
+from .constitution import (
+    ConstitutionChecker,
+    ConstitutionCheck,
+    configure_constitution_checker,
+    constitution_check,
+    get_constitution_checker,
+    get_constitution_prompt_block,
+)
+from .slow_thinking import (
+    SlowThinkingEngine,
+    SlowThinkingResult,
+    ThinkingLevel,
+    configure_slow_thinking,
+    get_slow_thinking,
+    think,
+    parse_level,
+)
+from .ensemble import (
+    EnsembleSolver,
+    EnsembleResult,
+    configure_ensemble_solver,
+    ensemble_solve,
+    get_ensemble_solver,
+    register_ensemble_model,
+)
+from .capability_resolver import (
+    CapabilityResolver,
+    ResolutionResult,
+    configure_resolver,
+    get_resolver,
+    list_auto_tools,
+    remove_auto_tool,
+    resolve_capability,
+)
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None
@@ -821,6 +857,43 @@ def configure_reasoning_stack(
             summarize_threshold=cfg.output_formatter_summarize_threshold,
         )
 
+    # v3 phase 1: Verifier (self-verification loop).
+    if cfg.verifier_enabled:
+        configure_verifier(
+            llm_call=llm_call,
+            max_iterations=cfg.verifier_max_iterations,
+            pass_threshold=cfg.verifier_pass_threshold,
+        )
+
+    # v3 phase 2: Constitution (value alignment).
+    if cfg.constitution_enabled:
+        configure_constitution_checker(llm_call=llm_call)
+
+    # v3 phase 3: SlowThinking (multi-level deep reasoning).
+    if cfg.slow_thinking_enabled:
+        configure_slow_thinking(
+            llm_call=llm_call,
+            default_level=cfg.slow_thinking_default_level,
+            store_traces=cfg.slow_thinking_store_traces,
+        )
+
+    # v3 phase 4: Ensemble (multi-model + judge). Models must be
+    # registered separately via register_ensemble_model(name, llm_call).
+    if cfg.ensemble_enabled:
+        configure_ensemble_solver(
+            judge_llm_call=llm_call,
+            max_workers=cfg.ensemble_max_workers,
+            timeout_seconds=cfg.ensemble_timeout_seconds,
+        )
+
+    # v3 phase 5: CapabilityResolver (auto-install/create tools).
+    if cfg.capability_resolver_enabled:
+        configure_resolver(
+            llm_call=llm_call,
+            auto_approve=cfg.capability_resolver_auto_approve,
+            allow_network=cfg.capability_resolver_allow_network,
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Tool router public API
@@ -1378,3 +1451,302 @@ def format_for_slack(text: str) -> list[dict[str, Any]]:
 def format_for_discord(text: str) -> list[dict[str, Any]]:
     """Convenience wrapper for Discord formatting."""
     return format_for_delivery(text, platform="discord")
+
+
+# --------------------------------------------------------------------------- #
+# v3 cognitive extensions — public API
+# --------------------------------------------------------------------------- #
+
+
+def verify_agent_response(
+    *,
+    user_request: str,
+    agent_response: str,
+    context: str = "",
+) -> dict[str, Any]:
+    """Public API: verify an agent response. Returns possibly-revised response.
+
+    Pipeline: critique → revise (if needed) → re-critique. Max 3 iterations.
+    Returns dict with:
+        - final_response: str (possibly revised)
+        - passed: bool (True if verified)
+        - iterations: int
+        - warning: str (non-empty if not passed)
+        - scores: dict (factual/logical/completeness/hallucination/safety)
+    """
+    cfg = load_unified_config()
+    if not cfg.verifier_enabled:
+        return {
+            "final_response": agent_response,
+            "passed": True,
+            "iterations": 0,
+            "warning": "verifier disabled",
+            "scores": {},
+        }
+    result = verify_response(
+        user_request=user_request,
+        agent_response=agent_response,
+        context=context,
+    )
+    scores = {}
+    if result.final_critique is not None:
+        scores = {
+            "factual_accuracy": result.final_critique.factual_accuracy,
+            "logical_consistency": result.final_critique.logical_consistency,
+            "completeness": result.final_critique.completeness,
+            "no_hallucination": result.final_critique.no_hallucination,
+            "safety": result.final_critique.safety,
+            "overall": result.final_critique.overall,
+        }
+    return {
+        "final_response": result.final_response,
+        "passed": result.passed,
+        "iterations": result.iterations,
+        "warning": result.warning,
+        "scores": scores,
+    }
+
+
+def check_constitution(
+    *,
+    user_request: str,
+    response: str,
+    context: str = "",
+) -> dict[str, Any]:
+    """Public API: check a response against constitutional principles."""
+    cfg = load_unified_config()
+    if not cfg.constitution_enabled:
+        return {"enabled": False, "aligned": True}
+    result = constitution_check(user_request=user_request, response=response, context=context)
+    return {
+        "enabled": True,
+        "aligned": result.aligned,
+        "score": result.score,
+        "violations": result.violations,
+        "concerns": result.concerns,
+        "explanation": result.explanation,
+    }
+
+
+def think_slow(
+    *,
+    request: str,
+    context: str = "",
+    level: str = "",
+) -> dict[str, Any]:
+    """Public API: run slow thinking. Returns dict with final_answer.
+
+    Args:
+        request: the user's request
+        context: additional context
+        level: "fast" | "balanced" | "deep" | "max" (default: config default)
+
+    Returns:
+        dict with: final_answer, level, rounds, total_llm_calls, reasoning_trace
+    """
+    cfg = load_unified_config()
+    if not cfg.slow_thinking_enabled:
+        return {
+            "enabled": False,
+            "final_answer": "",
+        }
+    result = think(
+        request=request,
+        context=context,
+        level=level or cfg.slow_thinking_default_level,
+    )
+    return {
+        "enabled": True,
+        "final_answer": result.final_answer,
+        "level": result.level.name,
+        "rounds": len(result.rounds),
+        "total_llm_calls": result.total_llm_calls,
+        "total_elapsed_ms": result.total_elapsed_ms,
+        "reasoning_trace_preview": result.reasoning_trace[:500] if result.reasoning_trace else "",
+    }
+
+
+def ensemble_request(
+    *,
+    request: str,
+    context: str = "",
+    system_prompt: str = "You are a helpful AI assistant.",
+) -> dict[str, Any]:
+    """Public API: run ensemble solve (multi-model + judge).
+
+    Returns dict with: final_answer, decision, chosen_model, disagreement,
+    responses (list of model responses), judge_rationale.
+    """
+    cfg = load_unified_config()
+    if not cfg.ensemble_enabled:
+        return {"enabled": False, "final_answer": ""}
+    result = ensemble_solve(request=request, context=context, system_prompt=system_prompt)
+    return {
+        "enabled": True,
+        "final_answer": result.final_answer,
+        "decision": result.decision,
+        "chosen_model": result.chosen_model,
+        "disagreement": result.disagreement,
+        "judge_rationale": result.judge_rationale,
+        "responses": [
+            {
+                "model_name": r.model_name,
+                "response_preview": r.response[:200],
+                "error": r.error,
+                "elapsed_ms": r.elapsed_ms,
+            }
+            for r in result.responses
+        ],
+        "total_llm_calls": result.total_llm_calls,
+        "total_elapsed_ms": result.total_elapsed_ms,
+    }
+
+
+def add_ensemble_model(name: str, llm_call) -> None:
+    """Public API: register a model in the ensemble."""
+    register_ensemble_model(name, llm_call)
+
+
+def resolve_missing_capability(
+    *,
+    capability: str,
+    context: str = "",
+    approve_fn=None,
+) -> dict[str, Any]:
+    """Public API: resolve a missing capability (auto-install or auto-create tool).
+
+    Pipeline:
+        1. Check existing tools → if found, return
+        2. Search PyPI → pip install + generate wrapper
+        3. Search MCP registry → hermes mcp install
+        4. Generate new tool from scratch via LLM
+
+    Args:
+        capability: description of what's needed (e.g., "send Slack message")
+        context: additional context
+        approve_fn: callable(action: str, target_dir: str) -> bool.
+            Required unless auto_approve=True in config.
+
+    Returns dict with: method, tool_name, file_path, error (if any).
+    """
+    cfg = load_unified_config()
+    if not cfg.capability_resolver_enabled:
+        return {"enabled": False, "method": "failed", "error": "resolver disabled"}
+    result = resolve_capability(
+        capability=capability,
+        context=context,
+        approve_fn=approve_fn,
+    )
+    return {
+        "enabled": True,
+        "capability": result.capability,
+        "method": result.method,
+        "tool_name": result.tool_name,
+        "package_name": result.package_name,
+        "file_path": result.file_path,
+        "error": result.error,
+        "approved": result.approved,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+
+def list_installed_auto_tools() -> list[dict[str, Any]]:
+    """Public API: list auto-installed/generated tools."""
+    return list_auto_tools()
+
+
+def remove_installed_auto_tool(name: str) -> bool:
+    """Public API: remove an auto-installed/generated tool."""
+    return remove_auto_tool(name)
+
+
+# --------------------------------------------------------------------------- #
+# Convenience: full cognitive pipeline (for conversation loop)
+# --------------------------------------------------------------------------- #
+
+
+def run_cognitive_pipeline(
+    *,
+    user_request: str,
+    context: str = "",
+    thinking_level: str = "",
+    use_ensemble: bool = False,
+    use_verifier: bool = True,
+    use_constitution: bool = True,
+) -> dict[str, Any]:
+    """Run the full cognitive pipeline for a request.
+
+    Pipeline:
+        1. (optional) Slow thinking at requested level
+        2. (optional) Ensemble solve if use_ensemble=True
+        3. (optional) Constitution check
+        4. (optional) Verifier (critique → revise → re-critique)
+
+    Returns dict with: final_response, metadata about each phase.
+
+    This is the high-level entry point the conversation loop should call
+    for non-trivial requests. For trivial chat, skip this and use the
+    normal agent path.
+    """
+    cfg = load_unified_config()
+    started = time.time()
+    metadata: dict[str, Any] = {"phases": {}}
+
+    # Phase 1: Generate initial response.
+    if cfg.slow_thinking_enabled and thinking_level != "fast":
+        st_result = think_slow(
+            request=user_request,
+            context=context,
+            level=thinking_level or cfg.slow_thinking_default_level,
+        )
+        metadata["phases"]["slow_thinking"] = st_result
+        current_response = st_result.get("final_answer", "")
+    elif use_ensemble and cfg.ensemble_enabled:
+        ens_result = ensemble_request(request=user_request, context=context)
+        metadata["phases"]["ensemble"] = ens_result
+        current_response = ens_result.get("final_answer", "")
+    else:
+        current_response = ""  # caller provides initial response
+
+    if not current_response:
+        return {
+            "final_response": "",
+            "metadata": metadata,
+            "error": "no response generated (slow_thinking and ensemble both disabled/failed)",
+        }
+
+    # Phase 2: Constitution check.
+    if use_constitution and cfg.constitution_enabled:
+        const_result = check_constitution(
+            user_request=user_request,
+            response=current_response,
+            context=context,
+        )
+        metadata["phases"]["constitution"] = const_result
+        if not const_result.get("aligned", True) and const_result.get("violations"):
+            # Re-run slow thinking with violation feedback.
+            if cfg.slow_thinking_enabled:
+                violations_text = "; ".join(const_result["violations"])
+                st_result = think_slow(
+                    request=user_request,
+                    context=f"{context}\n\n[Constitution violations to fix: {violations_text}]",
+                    level=thinking_level or cfg.slow_thinking_default_level,
+                )
+                current_response = st_result.get("final_answer", current_response)
+                metadata["phases"]["slow_thinking_revision"] = st_result
+
+    # Phase 3: Verifier.
+    if use_verifier and cfg.verifier_enabled:
+        ver_result = verify_agent_response(
+            user_request=user_request,
+            agent_response=current_response,
+            context=context,
+        )
+        metadata["phases"]["verifier"] = ver_result
+        current_response = ver_result.get("final_response", current_response)
+
+    metadata["total_elapsed_ms"] = int((time.time() - started) * 1000)
+    return {
+        "final_response": current_response,
+        "metadata": metadata,
+    }
