@@ -390,6 +390,122 @@ class ReasoningProtocol:
             return None
 
     # ------------------------------------------------------------------ #
+    # Batch reflection (for background worker)
+    # ------------------------------------------------------------------ #
+
+    _REFLECT_BATCH_SYSTEM_PROMPT = (
+        "You are the reflection layer of an AI agent. You will receive a "
+        "batch of N completed tool calls. For each, compare the expected "
+        "outcome to the actual outcome, and extract a transferable lesson. "
+        "Be specific — generic lessons like 'be careful' are useless. If "
+        "an item has nothing notable, return an empty lesson for it.\n\n"
+        "Return STRICT JSON: an array of N objects, in the same order as "
+        "the input. Schema per object:\n"
+        "{\n"
+        '  "outcome_matched": true | false,\n'
+        '  "expected": "what the plan expected",\n'
+        '  "actual": "what actually happened (brief)",\n'
+        '  "lesson": "the transferable lesson, or empty if nothing notable",\n'
+        '  "score": 0.0 to 5.0\n'
+        "}"
+    )
+
+    def reflect_batch(
+        self,
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any] | None]:
+        """Reflect on a batch of completed tool calls in one LLM call.
+
+        Used by the background reflection worker (longrun.py). Each item
+        in `items` is a dict with: plan, tool_name, args, result,
+        duration_ms, session_id, turn_id, scope.
+
+        Returns a list of the same length as `items`, where each entry
+        is either None (reflection failed) or a dict with keys:
+        outcome_matched, expected, actual, lesson, score.
+        """
+        n = len(items)
+        if n == 0 or self._llm_call is None:
+            return [None] * n
+
+        # Build a single prompt with all items.
+        parts = [f"Batch of {n} tool calls to reflect on:\n"]
+        for i, item in enumerate(items, 1):
+            plan = item.get("plan")
+            plan_block = (
+                plan.as_prompt_block()
+                if hasattr(plan, "as_prompt_block")
+                else f"(plan: {str(item.get('plan_summary', ''))[:200]})"
+            )
+            result_preview = self._preview(item.get("result"), max_chars=600)
+            parts.append(
+                f"\n--- Item {i} ---\n"
+                f"Tool: {item.get('tool_name', '?')}\n"
+                f"Duration: {item.get('duration_ms', 0)} ms\n"
+                f"Plan:\n{plan_block}\n"
+                f"Result (truncated):\n{result_preview}\n"
+            )
+        user_prompt = "\n".join(parts) + "\n\nReturn the JSON array now."
+
+        try:
+            raw = self._llm_call(self._REFLECT_BATCH_SYSTEM_PROMPT, user_prompt)
+            data = self._parse_json_array(raw)
+            if data is None or len(data) != n:
+                # Length mismatch — can't reliably associate. Drop all.
+                return [None] * n
+            results: list[dict[str, Any] | None] = []
+            for entry in data:
+                if not isinstance(entry, dict):
+                    results.append(None)
+                    continue
+                try:
+                    score = float(entry.get("score", 1.0))
+                except (TypeError, ValueError):
+                    score = 1.0
+                results.append(
+                    {
+                        "outcome_matched": bool(entry.get("outcome_matched", False)),
+                        "expected": str(entry.get("expected", "")).strip(),
+                        "actual": str(entry.get("actual", "")).strip(),
+                        "lesson": str(entry.get("lesson", "")).strip(),
+                        "score": max(0.0, min(5.0, score)),
+                    }
+                )
+            return results
+        except Exception:
+            return [None] * n
+
+    @staticmethod
+    def _parse_json_array(raw: str) -> list[dict[str, Any]] | None:
+        if not raw:
+            return None
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        # Fallback: extract [ ... ] block.
+        start = text.find("[")
+        end = text.rfind("]")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start : end + 1])
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                return None
+        return None
+
+    # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
 

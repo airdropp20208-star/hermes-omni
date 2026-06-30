@@ -19,6 +19,13 @@ from typing import Any
 from .config import load_unified_config
 from .decision import Classification, DecisionClass, DecisionFramework
 from .events import EventBus
+from .longrun import (
+    LongRunEngine,
+    WorkItemPriority,
+    configure_engine,
+    get_engine,
+    shutdown_engine,
+)
 from .policy import Decision, PolicyEngine
 from .reasoning import ReasoningPlan, ReasoningProtocol, configure_protocol, get_protocol
 from .reflexion import ReflexionRecord, ReflexionStore, record_from_tool_failure
@@ -29,6 +36,7 @@ from .smart_guardian import (
     configure_guardian,
     get_guardian,
 )
+from .tool_router import ToolRouter, get_router, refresh_router
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None
@@ -328,44 +336,76 @@ def after_tool_call(
             pass
 
     # New: reasoning reflection. Only when reasoning_enabled AND a plan
-    # was made for this call. The reflection is persisted into the
-    # reflexion store as a separate record type, so future similar
-    # situations can recall both failure lessons AND reasoning lessons.
+    # was made for this call.
     if cfg.reasoning_enabled and cfg.persist_reflections and plan is not None:
-        try:
-            reflection = get_protocol().reflect(
-                plan=plan,
-                tool_name=tool_name,
-                args=args,
-                result=result,
-                duration_ms=duration_ms,
-            )
-            if reflection is not None and reflection.lesson:
-                from .reflexion import ReflexionRecord
-
-                refl_record = ReflexionRecord(
-                    lesson=reflection.lesson,
-                    source="reasoning_reflection",
-                    score=reflection.score,
-                    tags=["reflection", "reasoning"]
-                    + (["outcome_mismatch"] if not reflection.outcome_matched else []),
-                    session_id=session_id or "",
-                    turn_id=turn_id or "",
-                    tool_name=tool_name,
-                    scope=current_scope(),
+        # If longrun is enabled, push reflection to the background worker
+        # (debounced + batched). Otherwise run synchronously.
+        engine = get_engine() if cfg.longrun_enabled else None
+        if engine is not None:
+            # Background path — fire-and-forget.
+            try:
+                engine.enqueue_reflection(
+                    {
+                        "plan": plan,
+                        "tool_name": tool_name,
+                        "args": args,
+                        "result": result,
+                        "duration_ms": duration_ms,
+                        "session_id": session_id or "",
+                        "turn_id": turn_id or "",
+                        "scope": current_scope(),
+                    }
                 )
-                if get_store().add(refl_record):
-                    _bus.emit(
-                        "reflexion.add",
-                        {
-                            "tool_name": tool_name,
-                            "lesson": reflection.lesson[:300],
-                            "record_id": refl_record.record_id,
-                            "outcome_matched": reflection.outcome_matched,
-                        },
+            except Exception:
+                pass  # fail-open; reflection is best-effort
+        else:
+            # Synchronous path (v1 behavior).
+            try:
+                reflection = get_protocol().reflect(
+                    plan=plan,
+                    tool_name=tool_name,
+                    args=args,
+                    result=result,
+                    duration_ms=duration_ms,
+                )
+                if reflection is not None and reflection.lesson:
+                    from .reflexion import ReflexionRecord
+
+                    refl_record = ReflexionRecord(
+                        lesson=reflection.lesson,
+                        source="reasoning_reflection",
+                        score=reflection.score,
+                        tags=["reflection", "reasoning"]
+                        + (["outcome_mismatch"] if not reflection.outcome_matched else []),
                         session_id=session_id or "",
                         turn_id=turn_id or "",
+                        tool_name=tool_name,
+                        scope=current_scope(),
                     )
+                    if get_store().add(refl_record):
+                        _bus.emit(
+                            "reflexion.add",
+                            {
+                                "tool_name": tool_name,
+                                "lesson": reflection.lesson[:300],
+                                "record_id": refl_record.record_id,
+                                "outcome_matched": reflection.outcome_matched,
+                            },
+                            session_id=session_id or "",
+                            turn_id=turn_id or "",
+                        )
+            except Exception:
+                pass
+
+    # Tool router usage feedback (async, non-blocking).
+    if cfg.tool_router_enabled and cfg.tool_router_learn:
+        try:
+            # Use the tool_name + brief args as the "query" for usage
+            # tracking. This is a heuristic; the conversation loop can
+            # also call record_usage explicitly with the user's actual
+            # message for better signal.
+            args_str = json.dumps(args or {}, ensure_ascii=False, default=str)[:200]
+            get_router().record_usage(tool_name, f"{tool_name} {args_str}")
         except Exception:
             pass
 
@@ -468,6 +508,15 @@ def framework_status() -> dict[str, Any]:
         "persist_reflections": cfg.persist_reflections,
         "reasoning_protocol_wired": get_protocol()._llm_call is not None,
         "smart_guardian_wired": get_guardian()._llm_call is not None,
+        # v1.1 extensions
+        "longrun_enabled": cfg.longrun_enabled,
+        "longrun_status": longrun_status(),
+        "tool_router_enabled": cfg.tool_router_enabled,
+        "tool_router_top_n": cfg.tool_router_top_n,
+        "tool_router_learn": cfg.tool_router_learn,
+        "tool_router_stats": (
+            get_router().stats() if cfg.tool_router_enabled else None
+        ),
         "scope": current_scope(),
         "store": str(cfg.store_path),
         "vendored": {
@@ -531,3 +580,99 @@ def configure_reasoning_stack(
         cache_size=cfg.guardian_cache_size,
         cache_ttl_seconds=cfg.guardian_cache_ttl_seconds,
     )
+
+    # If longrun is enabled, wire the reflection batch function and start
+    # the engine.
+    if cfg.longrun_enabled:
+        engine = configure_engine(
+            heartbeat_seconds=cfg.longrun_heartbeat_seconds,
+            reflection_debounce_seconds=cfg.longrun_reflection_debounce_seconds,
+            reflection_batch_size=cfg.longrun_reflection_batch_size,
+            autostart=True,
+        )
+        # Wire the batch reflection function.
+        from .reasoning import get_protocol
+
+        engine.set_reflect_batch_fn(get_protocol().reflect_batch)
+
+
+# --------------------------------------------------------------------------- #
+# Tool router public API
+# --------------------------------------------------------------------------- #
+
+
+def suggest_tools_for_query(query: str, *, top_n: int | None = None) -> str:
+    """Return a markdown block of suggested tools for `query`.
+
+    Returns "" if tool router is disabled or no tools match. The
+    conversation loop should prepend this to the system prompt before
+    calling the LLM.
+    """
+    cfg = load_unified_config()
+    if not cfg.tool_router_enabled:
+        return ""
+    try:
+        router = get_router()
+        n = top_n if top_n is not None else cfg.tool_router_top_n
+        return router.format_suggestions(query, top_n=n)
+    except Exception:
+        return ""
+
+
+def record_tool_usage_for_message(tool_name: str, user_message: str) -> None:
+    """Record that `tool_name` was used in the context of `user_message`.
+
+    More accurate signal than the heuristic in after_tool_call (which
+    uses args). The conversation loop should call this when it knows
+    the user message that triggered a tool call.
+    """
+    cfg = load_unified_config()
+    if not cfg.tool_router_enabled or not cfg.tool_router_learn:
+        return
+    try:
+        get_router().record_usage(tool_name, user_message)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Long-run engine public API
+# --------------------------------------------------------------------------- #
+
+
+def longrun_status() -> dict[str, Any]:
+    """Return long-run engine stats, or {"enabled": false} if not running."""
+    cfg = load_unified_config()
+    if not cfg.longrun_enabled:
+        return {"enabled": False}
+    engine = get_engine()
+    if engine is None:
+        return {"enabled": True, "running": False}
+    return {"enabled": True, "running": True, **engine.stats()}
+
+
+def enqueue_longrun_work(
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    priority: WorkItemPriority = WorkItemPriority.NORMAL,
+    item_id: str = "",
+) -> str | None:
+    """Enqueue a work item to the long-run engine.
+
+    Returns the item_id, or None if the engine is not running. The
+    caller must register a handler for `kind` via `engine.register_handler`
+    before enqueuing (otherwise the item is dropped with a warning).
+    """
+    cfg = load_unified_config()
+    if not cfg.longrun_enabled:
+        return None
+    engine = get_engine()
+    if engine is None:
+        return None
+    return engine.enqueue(kind=kind, payload=payload, priority=priority, item_id=item_id)
+
+
+def shutdown_longrun(*, timeout: float = 5.0) -> None:
+    """Shut down the long-run engine. Call on agent exit."""
+    shutdown_engine(timeout=timeout)

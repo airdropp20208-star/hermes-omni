@@ -1,10 +1,12 @@
-# Reasoning-First Protocol v1 — Design Document
+# Reasoning-First Protocol — Design Document
 
-> **Status:** Implemented (opt-in). Default OFF; preserves legacy behavior.
+> **Status:** v1.1 implemented (opt-in). Default OFF; preserves legacy behavior.
 > **Author:** Super Z (autonomous development pass, 2026-06-30)
 > **Goal:** Turn Hermes-Omni into a reasoning-first agent where the framework
 > *enables* the LLM's intelligence instead of bottlenecking it, while
 > preventing reckless actions through context-aware safety (not regex).
+> **v1.1 additions:** Long-run engine (background reflection + checkpoint/resume),
+> Tool router (auto tool selection).
 
 ---
 
@@ -634,3 +636,382 @@ This design is successful if:
    mismatches (reflection).
 6. ✅ Agent never gets bricked by LLM outage (fail-open everywhere).
 7. ✅ Default behavior is unchanged (opt-in).
+8. ✅ Agent can run for hours/days without timeout (long-run engine).
+9. ✅ Agent picks the right tool without explicit prompting (tool router).
+
+---
+
+# Part II — v1.1: Long-Run Engine & Tool Router
+
+## 15. The Long-Run Problem
+
+v1 added 1-3 LLM calls per consequential action (plan + critique +
+reflection). This made the agent **smarter but slower**. For long-running
+autonomous work — "monitor this repo and refactor when needed" — the
+synchronous reflection after every tool call adds up:
+
+- 50 tool calls × 2s reflection each = 100s of pure reflection overhead
+- A single turn running for hours has no checkpoint — crash = total loss
+- No way to enqueue "do X, then Y, then Z" across multiple ticks
+- Reflection blocks the next tool call, increasing wall-clock time
+
+The LongRunEngine solves all of these.
+
+## 16. LongRunEngine Architecture
+
+```
+   ┌─────────────────────────────────────────────────────────┐
+   │                     LongRunEngine                       │
+   │                                                          │
+   │  ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
+   │  │  Work Queue  │ ─▶ │   Dispatcher │ ─▶ │  Worker   │ │
+   │  │ (priority)   │    │  (priority)  │    │ (1 thread)│ │
+   │  └──────────────┘    └──────────────┘    └───────────┘ │
+   │         │                                       │       │
+   │         ▼                                       ▼       │
+   │  ┌──────────────┐                      ┌──────────────┐│
+   │  │ Checkpoint   │ ◀── write after ────│  Result     ││
+   │  │ Store (JSONL)│     each item done  │  Sink       ││
+   │  └──────────────┘                      └──────────────┘│
+   │                                                          │
+   │  ┌──────────────────────────────────────────────────┐  │
+   │  │  Background Reflection Worker (separate thread)  │  │
+   │  │  - Debounced (waits 5s after last tool call)     │  │
+   │  │  - Batched (groups up to 10 reflections)         │  │
+   │  │  - Calls ReasoningProtocol.reflect_batch()       │  │
+   │  └──────────────────────────────────────────────────┘  │
+   └─────────────────────────────────────────────────────────┘
+```
+
+### 16.1 Key design decisions
+
+1. **Single worker thread.** Avoids concurrency headaches with the tool
+   registry (not thread-safe). One worker = no locking around tool dispatch.
+2. **Priority queue.** Critical work (user-initiated) jumps ahead of
+   background work (reflexion, indexing). Heap-based.
+3. **Checkpoint after every item.** Each completed item is appended to a
+   JSONL checkpoint file. On restart, the engine replays the checkpoint
+   to skip already-done items (idempotency).
+4. **Reflection is fire-and-forget.** The reflection worker runs on its
+   own thread and never blocks tool dispatch. If the LLM call fails, the
+   reflection is silently dropped (fail-open).
+5. **Heartbeat.** The engine emits a heartbeat event every N seconds so
+   monitoring can detect a stuck worker.
+6. **No external deps.** Stdlib only (threading, queue, json, pathlib).
+   No asyncio — would require rewriting the whole Hermes loop.
+
+### 16.2 Background reflection worker
+
+Debounced + batched:
+
+- **Debounce:** waits `debounce_seconds` (default 5s) after the last
+  reflection request before processing. Groups rapid-fire reflections
+  (e.g., from a loop of tool calls) into a single batch.
+- **Batch:** processes up to `batch_size` (default 10) items per LLM
+  call. Uses `ReasoningProtocol.reflect_batch()` which sends all items
+  in a single prompt and expects a JSON array back.
+- **Fail-open:** if `reflect_batch_fn` raises or returns wrong shape,
+  the whole batch is dropped (counted in `dropped` stat).
+
+This turns 50 reflections × 2s each = 100s of synchronous overhead into
+~5 batches × 3s each = 15s of background work that doesn't block the
+agent at all.
+
+### 16.3 Checkpoint/resume
+
+The `CheckpointStore` is a JSONL append-only log at
+`~/.hermes/unified/longrun_checkpoint.jsonl`. Each entry records:
+
+```json
+{
+  "item_id": "test_task_42",
+  "kind": "test_task",
+  "started_at": 1738243200.0,
+  "completed_at": 1738243200.5,
+  "success": true,
+  "result_preview": "processed test_task_42",
+  "error": ""
+}
+```
+
+On engine restart, the store is replayed to populate the
+`_completed_ids` set. The dispatcher checks this set before processing
+any item — duplicates are skipped silently. This means:
+
+- Process crash mid-batch? Restart and the engine picks up where it
+  left off.
+- Network blip causes a duplicate enqueue? The second one is skipped.
+- Want a fresh start? Call `engine.reset_checkpoint()`.
+
+### 16.4 Configuration
+
+```yaml
+unified:
+  longrun:
+    enabled: false                    # default OFF
+    heartbeat_seconds: 30.0
+    reflection_debounce_seconds: 5.0
+    reflection_batch_size: 10
+```
+
+Env override: `HERMES_UNIFIED_LONGRUN=1`
+
+### 16.5 Public API
+
+```python
+from agent.unified.integration import (
+    longrun_status,
+    enqueue_longrun_work,
+    shutdown_longrun,
+)
+
+# Check status
+print(longrun_status())
+# → {"enabled": True, "running": True, "queue_size": 3, "items_processed": 42, ...}
+
+# Enqueue custom work
+item_id = enqueue_longrun_work(
+    kind="my_custom_task",
+    payload={"repo": "https://github.com/foo/bar", "action": "audit"},
+    priority=WorkItemPriority.LOW,
+)
+
+# Shutdown (call on agent exit)
+shutdown_longrun(timeout=5.0)
+```
+
+To register a custom handler:
+
+```python
+from agent.unified.longrun import get_engine
+
+engine = get_engine()
+if engine is not None:
+    engine.register_handler("my_custom_task", my_handler_fn)
+```
+
+---
+
+## 17. Tool Router — Auto Tool Selection
+
+### 17.1 The problem
+
+A senior engineer doesn't need to be told "use grep to search files" —
+they just know. The same is true for LLMs:
+
+- Top-tier models (Claude Opus, GPT-5, GLM-4.6) rarely need help.
+- Mid-tier models often pick the wrong tool, miss available tools, or
+  use generic `bash` when a purpose-built tool would work better.
+- Even top-tier models miss tools they don't know exist — MCP servers,
+  custom plugins, newly-registered skills.
+
+### 17.2 Architecture
+
+The ToolRouter:
+
+1. **Indexes all available tools** from `tools.registry` — name,
+   description, parameters, toolset, source.
+2. **Routes by intent** — given a natural-language task description,
+   returns the top-N tools most likely to be relevant. Uses BM25 first
+   (cheap), then intent-pattern boosts (rule-based multipliers).
+3. **Injects suggestions into the system prompt** — when enabled, the
+   router prepends a `<tool-suggestions>` block so the LLM sees the
+   suggestions before generating a tool call.
+4. **Learns from usage** — counts how often each tool is actually
+   called for a given intent. Frequently-used tools get a relevance
+   boost in future routing.
+
+### 17.3 Algorithm
+
+For a given query:
+
+1. Tokenize query (lowercase alphanumeric).
+2. Compute BM25 score against every tool's tokenized text
+   (name + description + parameter names).
+3. Apply intent pattern boosts — 25 regex patterns detect common
+   intents (read file, search, execute, web search, etc.) and multiply
+   the BM25 score for matching tools.
+4. Add usage bonus — for each query token, if the tool was previously
+   called with that token in the query, add a small bonus (capped at
+   +1.0 total).
+5. Return top-N tools, formatted as a markdown block.
+
+### 17.4 Intent patterns (excerpt)
+
+| Pattern | Boosts |
+|---|---|
+| `read\|cat\|view file` | `read*` ×3.0, `file*` ×2.0, `cat*` ×2.0 |
+| `search\|find\|grep in files` | `grep*` ×3.0, `search*` ×2.5, `find*` ×2.5 |
+| `run\|execute\|bash\|shell` | `bash*` ×3.0, `shell*` ×2.5, `execute*` ×2.5 |
+| `search\|google the web` | `web_search*` ×3.0, `search*` ×2.5 |
+| `remember\|recall\|past experience` | `unified_recall*` ×3.0, `recall*` ×2.5 |
+| `plan\|think\|reason before` | `reasoning_plan*` ×3.0 |
+| `generate image\|picture` | `image_gen*` ×3.0 |
+| `schedule\|cron\|every day` | `cron*` ×3.0 |
+| `delegate\|subagent\|parallel` | `delegate*` ×3.0 |
+| ... | (25 patterns total) |
+
+### 17.5 Configuration
+
+```yaml
+unified:
+  tool_router:
+    enabled: false       # default OFF
+    top_n: 5             # tools to suggest in system prompt
+    learn: true          # learn from usage
+```
+
+Env override: `HERMES_UNIFIED_TOOL_ROUTER=1`
+
+### 17.6 Public API
+
+```python
+from agent.unified.integration import (
+    suggest_tools_for_query,
+    record_tool_usage_for_message,
+)
+
+# In the conversation loop, before calling the LLM:
+suggestions = suggest_tools_for_query(user_message)
+if suggestions:
+    system_prompt = suggestions + "\n\n" + system_prompt
+
+# After a tool call (for usage learning):
+record_tool_usage_for_message(tool_name, user_message)
+```
+
+### 17.7 Integration with existing tool_search.py
+
+The existing `tools/tool_search.py` uses a "bridge tool" pattern to
+defer tool loading — only the core tools are loaded initially, and a
+`search_tools` bridge tool lets the LLM discover deferred tools on
+demand. The ToolRouter is **complementary**:
+
+- `tool_search.py` handles the **lazy loading** mechanics (don't load
+  500 tool schemas until needed).
+- `ToolRouter` handles **proactive suggestion** (tell the LLM which
+  tools are relevant *before* it has to ask).
+
+They can coexist: ToolRouter suggests the top-5 tools for the current
+task, and `tool_search.py` still defers the rest. If the LLM follows
+the suggestion, no bridge tool call is needed. If it doesn't, the
+bridge tool is still available.
+
+---
+
+## 18. v1.1 File Inventory
+
+### New files
+
+| File | Lines | Purpose |
+|---|---|---|
+| `agent/unified/longrun.py` | ~430 | LongRunEngine + CheckpointStore + ReflectionWorker |
+| `agent/unified/tool_router.py` | ~370 | ToolRouter with BM25 + intent patterns + usage learning |
+
+### Modified files
+
+| File | Changes |
+|---|---|
+| `agent/unified/config.py` | +7 new config fields (longrun + tool_router) with env var overrides |
+| `agent/unified/integration.py` | Wired longrun + tool_router; added `suggest_tools_for_query()`, `record_tool_usage_for_message()`, `longrun_status()`, `enqueue_longrun_work()`, `shutdown_longrun()` public APIs; reflection now branches to background worker when longrun enabled; updated `framework_status()` with v1.1 fields |
+| `agent/unified/reasoning.py` | Added `reflect_batch()` for batched background reflection + `_parse_json_array()` helper |
+| `docs/REASONING_DESIGN.md` | This Part II section |
+
+---
+
+## 19. v1.1 Testing
+
+Smoke tests run during development:
+
+- **ToolRouter**: 5 test queries (read file, search logs, run python,
+  recall memory, find files) — all return relevant tools. Usage learning
+  verified (grep boosted after 3 recorded uses for "search" queries).
+  ✅
+- **LongRunEngine**: 3 items enqueued with priorities NORMAL/HIGH/CRITICAL
+  → processed in priority order (CRITICAL→HIGH→NORMAL). Idempotency
+  verified (re-enqueue of completed item_id is skipped). Checkpoint
+  persistence verified (store has 3 entries after restart). ✅
+- **ReflectionWorker**: 5 reflections enqueued → batched into 1 LLM call
+  after 5s debounce. `reflect_batch_fn` called once with all 5 items. ✅
+- **ReasoningProtocol.reflect_batch**: 3-item batch → 1 LLM call → 3
+  results. Empty batch → empty results. No-LLM → all None. ✅
+
+---
+
+## 20. v1.1 Limitations & Future Work
+
+### 20.1 Single worker thread
+
+The LongRunEngine uses a single worker thread to avoid concurrency
+issues with the tool registry. For I/O-bound work (network calls), this
+limits throughput. A future version could use a thread pool for
+I/O-bound handlers while keeping tool dispatch single-threaded.
+
+### 20.2 No streaming for plan generation
+
+Plan LLM calls are still synchronous in v1.1. For long plans (e.g.,
+IRREVERSIBLE actions with full critique), this can block the agent for
+5-15s. Streaming would improve UX.
+
+### 20.3 Tool router has no LLM reranker
+
+The router uses BM25 + rule-based intent patterns. An LLM reranker
+(prompt: "given these 10 candidate tools and this task, which 3 are
+most relevant?") would improve accuracy for ambiguous queries. Opt-in,
+behind a config flag.
+
+### 20.4 No automatic tool router refresh
+
+The catalog is built once at first use. If tools are registered
+dynamically (e.g., a new MCP server connects mid-session), the router
+won't know about them until `refresh_router()` is called. A future
+version could hook into `registry.register()` to auto-refresh.
+
+### 20.5 Reflection worker doesn't retry
+
+If `reflect_batch_fn` raises, the entire batch is dropped. A retry with
+smaller batch size (e.g., split 10 into 2×5) would recover more
+reflections. Trade-off: complexity vs. reflection value.
+
+### 20.6 No persistence of usage histogram
+
+The ToolRouter's usage histogram is in-memory only. On restart, the
+learning is lost. A future version could persist it to
+`~/.hermes/unified/tool_usage.json` alongside the reflexion store.
+
+---
+
+## 21. v1.1 Migration Path
+
+For users currently on v1 (reasoning-first protocol) who want to enable
+long-run + tool router:
+
+```yaml
+unified:
+  reasoning:
+    enabled: true
+    persist_reflections: true
+  smart_guardian:
+    enabled: true
+    hard_block_irreversible: true
+  # New in v1.1:
+  longrun:
+    enabled: true
+    reflection_debounce_seconds: 5.0
+    reflection_batch_size: 10
+  tool_router:
+    enabled: true
+    top_n: 5
+    learn: true
+```
+
+Then wire the LLM (same as v1):
+
+```python
+from agent.unified.integration import configure_reasoning_stack
+configure_reasoning_stack(llm_call=my_llm_client.chat)
+```
+
+The `configure_reasoning_stack()` function now also starts the long-run
+engine and wires the reflection batch function, if `longrun.enabled` is
+true. No extra wiring needed.
