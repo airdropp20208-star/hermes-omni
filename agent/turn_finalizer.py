@@ -478,4 +478,27 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    # v3 cognitive pipeline — verifier + constitution on the final response.
+    # Best-effort: any failure leaves the original response unchanged.
+    try:
+        from agent.unified.runtime_wiring import maybe_run_cognitive_pipeline
+
+        _fr = result.get("final_response")
+        if _fr and isinstance(_fr, str) and not result.get("interrupted") and not result.get("failed"):
+            _revised = maybe_run_cognitive_pipeline(
+                agent,
+                user_message,
+                _fr,
+            )
+            if _revised and _revised != _fr:
+                result["final_response"] = _revised
+                # Update the last assistant message in messages so callers
+                # see the revised version.
+                for _i in range(len(messages) - 1, -1, -1):
+                    if messages[_i].get("role") == "assistant":
+                        messages[_i]["content"] = _revised
+                        break
+    except Exception:
+        pass
+
     return result

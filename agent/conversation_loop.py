@@ -547,6 +547,15 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
+
+    # v3 cognitive modules — record current user message so tool router
+    # learning and other modules can correlate tool calls with intent.
+    try:
+        from agent.unified.runtime_wiring import _set_last_user_message
+        _set_last_user_message(user_message)
+    except Exception:
+        pass
+
     _ctx = build_turn_context(
         agent,
         user_message,

@@ -3136,6 +3136,30 @@ def select_provider_and_model(args=None):
     } and not selected_provider.startswith("custom:"):
         _clear_stale_openai_base_url()
 
+    # v3 cognitive modules — re-wire LLM client after model switch.
+    # Best-effort: cognitive modules degrade gracefully if this fails.
+    try:
+        from agent.unified.runtime_wiring import wire_llm_client
+        from run_agent import AIAgent as _AIAgent
+        # Use the global agent if available, else construct a minimal shim.
+        _agent = globals().get("_active_agent")
+        if _agent is None:
+            # Build a minimal shim with provider/model attrs so wire_llm_client
+            # can extract a callable. We don't actually create a full client
+            # here — wire_llm_client will lazy-init on first use.
+            class _Shim:
+                pass
+            _shim = _Shim()
+            _shim.provider = selected_provider
+            _shim.model = config.get("model", {}).get("default", "") if isinstance(config.get("model"), dict) else config.get("model", "")
+            _shim.client = None  # wire_llm_client handles None gracefully
+            _shim.conversation_history = []
+            wire_llm_client(_shim)
+        else:
+            wire_llm_client(_agent)
+    except Exception:
+        pass
+
 
 def _clear_stale_openai_base_url():
     """Remove OPENAI_BASE_URL from ~/.hermes/.env if the active provider is not 'custom'.

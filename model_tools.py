@@ -1254,6 +1254,18 @@ def handle_function_call(
         except Exception as _unified_err:
             logger.debug("unified post-tool integration error: %s", _unified_err)
 
+        # v3: notify runtime_wiring of tool completion for usage tracking.
+        try:
+            from agent.unified.runtime_wiring import on_tool_call_complete
+            on_tool_call_complete(
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                user_message="",  # populated from _last_user_message in runtime_wiring
+            )
+        except Exception:
+            pass
+
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
         # returning a string from transform_tool_result. Runs after

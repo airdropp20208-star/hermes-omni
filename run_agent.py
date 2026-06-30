@@ -503,6 +503,14 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
+        # v3 cognitive modules — wire LLM client now that agent is ready.
+        # Best-effort: if it fails, cognitive modules degrade gracefully.
+        try:
+            from agent.unified.runtime_wiring import wire_llm_client
+            wire_llm_client(self)
+        except Exception:
+            pass
+
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
 

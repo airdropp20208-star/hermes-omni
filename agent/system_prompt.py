@@ -460,6 +460,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 
+    # v3 cognitive modules — inject constitution, tool suggestions, task
+    # plan progress, distilled context, recalled learnings. All fail-safe.
+    try:
+        from agent.unified.runtime_wiring import augment_volatile_prompt
+        cognitive_block = augment_volatile_prompt(agent, None)
+        if cognitive_block:
+            volatile_parts.append(cognitive_block)
+    except Exception:
+        pass
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),

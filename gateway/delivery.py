@@ -445,7 +445,19 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
-        result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        # v3 OutputFormatter — chunk + escape for platform before sending.
+        # If formatter is disabled, returns single chunk with raw content.
+        try:
+            from agent.unified.runtime_wiring import format_for_delivery as _fmt
+            chunks = _fmt(content, platform=target.platform.value)
+        except Exception:
+            chunks = [{"text": content, "part": 1, "total_parts": 1, "is_last": True}]
+        result = None
+        for chunk in chunks:
+            chunk_text = chunk["text"]
+            result = await adapter.send(target.chat_id, chunk_text, metadata=send_metadata or None)
+            if _send_result_failed(result):
+                break
         if _send_result_failed(result):
             if (
                 is_named_telegram_private_topic
@@ -468,7 +480,7 @@ class DeliveryRouter:
                     )
                 send_metadata["thread_id"] = str(refreshed_thread_id)
                 send_metadata["telegram_dm_topic_created_for_send"] = True
-                result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+                result = await adapter.send(target.chat_id, chunks[-1]["text"], metadata=send_metadata or None)
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
