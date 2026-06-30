@@ -126,6 +126,20 @@ class UnifiedConfig:
     skill_synthesis_enabled: bool = False
     skill_synthesis_min_occurrences: int = 3
     skill_synthesis_max_skills: int = 100
+    # --- v2.2 task planning ---
+    # TaskPlanner: decompose complex requests into subtasks, track
+    # progress, replan on failure. Persisted to
+    # ~/.hermes/unified/task_plans.json.
+    task_planner_enabled: bool = False
+    task_planner_max_subtasks: int = 15
+    task_planner_max_replans: int = 3
+    # --- v2.3 output formatting ---
+    # OutputFormatter: transform agent output for messaging platforms
+    # (Telegram MarkdownV2 escaping, JSON pretty-print, chunking, table
+    # conversion, control char stripping).
+    output_formatter_enabled: bool = False
+    output_formatter_summarize_long: bool = False
+    output_formatter_summarize_threshold: int = 8000
 
 
 _CONFIG_CACHE: UnifiedConfig | None = None
@@ -394,6 +408,43 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
     except Exception:
         skill_synthesis_max_skills = 100
 
+    # --- v2.2 task planning config ---
+    task_planner_enabled = _truthy(
+        _cfg_get("unified", "task_planner", "enabled", default=False), default=False
+    )
+    env_tp = _falsey_env("HERMES_UNIFIED_TASK_PLANNER")
+    if env_tp is not None:
+        task_planner_enabled = env_tp
+    try:
+        task_planner_max_subtasks = int(
+            _cfg_get("unified", "task_planner", "max_subtasks", default=15) or 15
+        )
+    except Exception:
+        task_planner_max_subtasks = 15
+    try:
+        task_planner_max_replans = int(
+            _cfg_get("unified", "task_planner", "max_replans", default=3) or 3
+        )
+    except Exception:
+        task_planner_max_replans = 3
+
+    # --- v2.3 output formatter config ---
+    output_formatter_enabled = _truthy(
+        _cfg_get("unified", "output_formatter", "enabled", default=False), default=False
+    )
+    env_of = _falsey_env("HERMES_UNIFIED_OUTPUT_FORMATTER")
+    if env_of is not None:
+        output_formatter_enabled = env_of
+    output_formatter_summarize_long = _truthy(
+        _cfg_get("unified", "output_formatter", "summarize_long", default=False), default=False
+    )
+    try:
+        output_formatter_summarize_threshold = int(
+            _cfg_get("unified", "output_formatter", "summarize_threshold", default=8000) or 8000
+        )
+    except Exception:
+        output_formatter_summarize_threshold = 8000
+
     _CONFIG_CACHE = UnifiedConfig(
         enabled=enabled,
         reflexion_enabled=reflexion_enabled,
@@ -439,5 +490,11 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         skill_synthesis_enabled=skill_synthesis_enabled,
         skill_synthesis_min_occurrences=skill_synthesis_min_occurrences,
         skill_synthesis_max_skills=skill_synthesis_max_skills,
+        task_planner_enabled=task_planner_enabled,
+        task_planner_max_subtasks=task_planner_max_subtasks,
+        task_planner_max_replans=task_planner_max_replans,
+        output_formatter_enabled=output_formatter_enabled,
+        output_formatter_summarize_long=output_formatter_summarize_long,
+        output_formatter_summarize_threshold=output_formatter_summarize_threshold,
     )
     return _CONFIG_CACHE

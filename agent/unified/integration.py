@@ -58,6 +58,15 @@ from .skill_synthesizer import (
     get_synthesizer,
     record_tool_call_for_synthesis,
 )
+# v2.2 task planning
+from .task_planner import TaskPlanner, configure_planner, get_planner
+# v2.3 output formatting
+from .output_formatter import (
+    OutputFormatter,
+    configure_formatter,
+    format_output_for_platform,
+    get_formatter,
+)
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None
@@ -797,6 +806,21 @@ def configure_reasoning_stack(
             max_skills=cfg.skill_synthesis_max_skills,
         )
 
+    # v2.2: TaskPlanner (decompose, track, replan).
+    if cfg.task_planner_enabled:
+        configure_planner(
+            llm_call=llm_call,
+            max_subtasks=cfg.task_planner_max_subtasks,
+            max_replans=cfg.task_planner_max_replans,
+        )
+
+    # v2.3: OutputFormatter (always configure — pure transformation, no LLM).
+    if cfg.output_formatter_enabled:
+        configure_formatter(
+            summarize_long_output=cfg.output_formatter_summarize_long,
+            summarize_threshold=cfg.output_formatter_summarize_threshold,
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Tool router public API
@@ -1188,3 +1212,169 @@ def trigger_skill_scan(*, force: bool = False) -> list[dict[str, Any]]:
         }
         for s in new_skills
     ]
+
+
+# --------------------------------------------------------------------------- #
+# v2.2 task planning — public API
+# --------------------------------------------------------------------------- #
+
+
+def create_task_plan(*, request: str, context: str = "") -> str | None:
+    """Decompose a complex request into a plan. Returns plan_id, or None."""
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return None
+    planner = get_planner()
+    if planner is None:
+        return None
+    plan = planner.create_plan(request=request, context=context)
+    if plan is None:
+        return None
+    _bus.emit(
+        "task.plan_created",
+        {"plan_id": plan.plan_id, "subtask_count": len(plan.subtasks)},
+    )
+    return plan.plan_id
+
+
+def get_task_plan_progress() -> str:
+    """Return the active plan progress as a prompt block. Empty if no plan."""
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return ""
+    planner = get_planner()
+    if planner is None:
+        return ""
+    return planner.get_progress_block()
+
+
+def start_task_subtask(subtask_id: str) -> bool:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return False
+    planner = get_planner()
+    if planner is None:
+        return False
+    return planner.start_subtask(subtask_id)
+
+
+def complete_task_subtask(subtask_id: str, *, result_summary: str = "") -> bool:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return False
+    planner = get_planner()
+    if planner is None:
+        return False
+    ok = planner.complete_subtask(subtask_id, result_summary=result_summary)
+    if ok:
+        _bus.emit("task.subtask_done", {"subtask_id": subtask_id})
+    return ok
+
+
+def fail_task_subtask(subtask_id: str, *, failure_reason: str = "") -> bool:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return False
+    planner = get_planner()
+    if planner is None:
+        return False
+    ok = planner.fail_subtask(subtask_id, failure_reason=failure_reason)
+    if ok:
+        _bus.emit("task.subtask_failed", {"subtask_id": subtask_id, "reason": failure_reason})
+    return ok
+
+
+def skip_task_subtask(subtask_id: str, *, reason: str = "") -> bool:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return False
+    planner = get_planner()
+    if planner is None:
+        return False
+    return planner.skip_subtask(subtask_id, reason=reason)
+
+
+def abandon_task_plan(*, reason: str = "") -> bool:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return False
+    planner = get_planner()
+    if planner is None:
+        return False
+    return planner.abandon_plan(reason=reason)
+
+
+def list_task_plans() -> list[dict[str, Any]]:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return []
+    planner = get_planner()
+    if planner is None:
+        return []
+    return planner.list_plans()
+
+
+def task_planner_stats() -> dict[str, Any]:
+    cfg = load_unified_config()
+    if not cfg.task_planner_enabled:
+        return {"enabled": False}
+    planner = get_planner()
+    if planner is None:
+        return {"enabled": True, "configured": False}
+    return {"enabled": True, "configured": True, **planner.stats()}
+
+
+# --------------------------------------------------------------------------- #
+# v2.3 output formatting — public API
+# --------------------------------------------------------------------------- #
+
+
+def format_for_delivery(
+    text: str,
+    *,
+    platform: str = "default",
+    max_length: int | None = None,
+) -> list[dict[str, Any]]:
+    """Format agent output for delivery to a messaging platform.
+
+    This is the main entry point for gateway/delivery.py to call before
+    sending a message. Returns a list of chunk dicts, each ready to be
+    sent as one message.
+
+    Args:
+        text: the raw agent output
+        platform: "telegram" | "discord" | "slack" | "whatsapp" | "signal" |
+                  "matrix" | "teams" | "email" | "sms" | "cli" | "default"
+        max_length: override platform default limit
+
+    Returns:
+        list of {"text": str, "part": int, "total_parts": int, "is_last": bool}
+
+    Platforms handled:
+        telegram: MarkdownV2 escaping, JSON→readable, table→plain text,
+                  control char stripping, chunking at 4096 chars
+        discord:  JSON→readable, chunking at 2000 chars
+        slack:    **bold**→*bold* (mrkdwn), chunking at 40000 chars
+        cli:      pass-through (no transformation)
+        default:  JSON→readable, table→plain text, control char stripping
+    """
+    cfg = load_unified_config()
+    if not cfg.output_formatter_enabled:
+        # Disabled — return single chunk with raw text.
+        return [{"text": text, "part": 1, "total_parts": 1, "is_last": True}]
+    return format_output_for_platform(text, platform=platform, max_length=max_length)
+
+
+def format_for_telegram(text: str) -> list[dict[str, Any]]:
+    """Convenience wrapper for Telegram formatting."""
+    return format_for_delivery(text, platform="telegram")
+
+
+def format_for_slack(text: str) -> list[dict[str, Any]]:
+    """Convenience wrapper for Slack formatting."""
+    return format_for_delivery(text, platform="slack")
+
+
+def format_for_discord(text: str) -> list[dict[str, Any]]:
+    """Convenience wrapper for Discord formatting."""
+    return format_for_delivery(text, platform="discord")
