@@ -1,0 +1,2737 @@
+From 47819a01fd6f190d04644d36b6b4529381aa0204 Mon Sep 17 00:00:00 2001
+From: Super Z <super-z@local>
+Date: Tue, 30 Jun 2026 11:24:28 +0000
+Subject: [PATCH 1/2] =?UTF-8?q?feat(reasoning):=20add=20reasoning-first=20?=
+ =?UTF-8?q?protocol=20v1=20=E2=80=94=20plan/critique/execute/reflect?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Turns Hermes-Omni from a tool-dispatch loop into a reasoning-first agent.
+The framework now FORCES the LLM to think before consequential actions,
+while preventing recklessness through context-aware safety (LLM-as-judge),
+not regex.
+
+This is the bridge between 'unlimited mode' (no safety, reckless) and
+'pattern-block mode' (regex can't reason). The agent has the appearance
+of unlimited autonomy while maintaining a context-aware safety net that
+scales with the LLM's intelligence.
+
+New modules under agent/unified/:
+  - decision.py     — DecisionFramework classifies actions by consequence
+                      (TRIVIAL / STANDARD / CONSEQUENTIAL / IRREVERSIBLE)
+  - reasoning.py    — ReasoningProtocol: plan → critique → reflect
+                      Single LLM call per phase. Fail-open everywhere.
+  - smart_guardian.py — LLM-as-judge guardian with cache + TTL.
+                      ALLOW/WARN/REQUIRE_USER_CONFIRM/BLOCK verdicts.
+                      Hard floor for IRREVERSIBLE by default.
+
+New tools (tools/reasoning_tools.py):
+  - reasoning_plan     — record explicit plan before action
+  - reasoning_critique — record self-critique
+  - reasoning_decide   — make auditable decision (escape hatch for hard floor)
+  - reasoning_reflect  — record post-action reflection (persisted to reflexion store)
+
+Modified:
+  - agent/unified/config.py — 6 new config fields with env var overrides
+  - agent/unified/integration.py — wired reasoning + smart guardian into
+        before_tool_call/after_tool_call; added configure_reasoning_stack()
+        public API; updated framework_status() with new flags
+  - agent/omni_integration.py — marked deprecated, points to agent/unified/
+
+Design doc: docs/REASONING_DESIGN.md
+
+All new behavior is opt-in (default OFF). Legacy Hermes behavior unchanged.
+Config flags:
+  unified.reasoning.enabled: false (default)
+  unified.smart_guardian.enabled: false (default)
+  unified.smart_guardian.hard_block_irreversible: true (default)
+  HERMES_UNIFIED_REASONING=1 / HERMES_UNIFIED_SMART_GUARDIAN=1 (env overrides)
+
+Smoke tested: classification, graceful degradation without LLM, mock LLM
+plan+verdict+cache hit. Formal tests to be added to tests/unified/.
+---
+ agent/omni_integration.py       |  32 +-
+ agent/unified/config.py         |  60 +++
+ agent/unified/decision.py       | 249 +++++++++++++
+ agent/unified/integration.py    | 355 ++++++++++++++++--
+ agent/unified/reasoning.py      | 472 ++++++++++++++++++++++++
+ agent/unified/smart_guardian.py | 358 ++++++++++++++++++
+ docs/REASONING_DESIGN.md        | 636 ++++++++++++++++++++++++++++++++
+ tools/reasoning_tools.py        | 361 ++++++++++++++++++
+ 8 files changed, 2488 insertions(+), 35 deletions(-)
+ create mode 100644 agent/unified/decision.py
+ create mode 100644 agent/unified/reasoning.py
+ create mode 100644 agent/unified/smart_guardian.py
+ create mode 100644 docs/REASONING_DESIGN.md
+ create mode 100644 tools/reasoning_tools.py
+
+diff --git a/agent/omni_integration.py b/agent/omni_integration.py
+index 0f41a42..e82b8cc 100644
+--- a/agent/omni_integration.py
++++ b/agent/omni_integration.py
+@@ -1,10 +1,32 @@
+ """OmniAgent Feature Integration — hooks into hermes-omni's conversation loop.
+ 
+-This module provides a thin integration layer that connects:
+-- Deep Reflexion → tool loop detection, error repeat, no-progress
+-- Guardian Agent → pre-execution risk review
+-- Sentinel Agent → task decomposition, progress tracking
+-- Context Evolution → auto-learn from failures
++.. deprecated:: v0.18.0
++    This module is the **legacy** integration layer from the original
++    OmniAgent port (commit 99097a0, 28 Jun 2026). It is being replaced
++    by the cleaner declarative layer at ``agent/unified/`` which wires
++    directly into ``model_tools.handle_function_call()``.
++
++    The two layers have overlapping functionality (guardian, reflexion,
++    sentinel) but different APIs and different storage paths:
++        - ``agent/unified/`` → ``~/.hermes/unified/reflexions.jsonl``
++        - ``agent/omni_integration.py`` → ``.hermes/learnings/lessons.jsonl``
++
++    **For new code, use ``agent/unified/`` instead.** Specifically:
++        - Guardian → ``agent.unified.smart_guardian.SmartGuardian``
++        - Reflexion → ``agent.unified.reflexion.ReflexionStore``
++        - Reasoning → ``agent.unified.reasoning.ReasoningProtocol``
++        - Decision → ``agent.unified.decision.DecisionFramework``
++
++    This file is kept for now so that ``conversation_loop.py`` (which
++    imports ``OmniFeatureGate``) continues to work. It will be removed
++    once the conversation loop is migrated to the unified layer.
++
++Original description (kept for historical context):
++    This module provides a thin integration layer that connects:
++    - Deep Reflexion → tool loop detection, error repeat, no-progress
++    - Guardian Agent → pre-execution risk review
++    - Sentinel Agent → task decomposition, progress tracking
++    - Context Evolution → auto-learn from failures
+ 
+ Usage in conversation_loop.py or tool_executor.py:
+     from agent.omni_integration import OmniFeatureGate
+diff --git a/agent/unified/config.py b/agent/unified/config.py
+index 724d2e4..cc8ec1d 100644
+--- a/agent/unified/config.py
++++ b/agent/unified/config.py
+@@ -48,6 +48,25 @@ class UnifiedConfig:
+     block_tools: tuple[str, ...] = ()
+     max_records: int = 2000
+     scope_by_cwd: bool = True
++    # --- Reasoning-first protocol (v1) ---
++    # When True, the agent generates structured plans before any
++    # CONSEQUENTIAL+ action, and reflects after. Off by default to
++    # preserve legacy behavior; enable explicitly to opt into the
++    # reasoning-first mode.
++    reasoning_enabled: bool = False
++    # When True, the Smart Guardian (LLM-as-judge) runs for
++    # CONSEQUENTIAL+ actions that pass the pattern layer. Off by default.
++    smart_guardian_enabled: bool = False
++    # When True, IRREVERSIBLE actions are auto-blocked at the framework
++    # layer even if the LLM judge says ALLOW. This is the hard floor.
++    # Set to False to trust the LLM judge entirely (Codex-style).
++    hard_block_irreversible: bool = True
++    # When True, the protocol persists reasoning reflections into the
++    # reflexion store, so lessons compound across sessions.
++    persist_reflections: bool = True
++    # Cache size & TTL for the Smart Guardian verdict cache.
++    guardian_cache_size: int = 512
++    guardian_cache_ttl_seconds: int = 3600
+ 
+ 
+ _CONFIG_CACHE: UnifiedConfig | None = None
+@@ -91,6 +110,41 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
+ 
+     scope_by_cwd = _truthy(_cfg_get("unified", "reflexion", "scope_by_cwd", default=True), default=True)
+ 
++    # --- Reasoning-first protocol config ---
++    reasoning_enabled = _truthy(
++        _cfg_get("unified", "reasoning", "enabled", default=False), default=False
++    )
++    env_reasoning = _falsey_env("HERMES_UNIFIED_REASONING")
++    if env_reasoning is not None:
++        reasoning_enabled = env_reasoning
++
++    smart_guardian_enabled = _truthy(
++        _cfg_get("unified", "smart_guardian", "enabled", default=False), default=False
++    )
++    env_smart_guardian = _falsey_env("HERMES_UNIFIED_SMART_GUARDIAN")
++    if env_smart_guardian is not None:
++        smart_guardian_enabled = env_smart_guardian
++
++    hard_block_irreversible = _truthy(
++        _cfg_get("unified", "smart_guardian", "hard_block_irreversible", default=True),
++        default=True,
++    )
++    persist_reflections = _truthy(
++        _cfg_get("unified", "reasoning", "persist_reflections", default=True), default=True
++    )
++    try:
++        guardian_cache_size = int(
++            _cfg_get("unified", "smart_guardian", "cache_size", default=512) or 512
++        )
++    except Exception:
++        guardian_cache_size = 512
++    try:
++        guardian_cache_ttl_seconds = int(
++            _cfg_get("unified", "smart_guardian", "cache_ttl_seconds", default=3600) or 3600
++        )
++    except Exception:
++        guardian_cache_ttl_seconds = 3600
++
+     _CONFIG_CACHE = UnifiedConfig(
+         enabled=enabled,
+         reflexion_enabled=reflexion_enabled,
+@@ -100,5 +154,11 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
+         block_tools=block_tools,
+         max_records=max_records,
+         scope_by_cwd=scope_by_cwd,
++        reasoning_enabled=reasoning_enabled,
++        smart_guardian_enabled=smart_guardian_enabled,
++        hard_block_irreversible=hard_block_irreversible,
++        persist_reflections=persist_reflections,
++        guardian_cache_size=guardian_cache_size,
++        guardian_cache_ttl_seconds=guardian_cache_ttl_seconds,
+     )
+     return _CONFIG_CACHE
+diff --git a/agent/unified/decision.py b/agent/unified/decision.py
+new file mode 100644
+index 0000000..e738fe0
+--- /dev/null
++++ b/agent/unified/decision.py
+@@ -0,0 +1,249 @@
++"""Decision Framework — classifies actions by consequence level.
++
++The classifier is the first gate in the reasoning protocol: it decides HOW MUCH
++reasoning an action deserves before the agent is allowed to execute it.
++
++Design principles
++-----------------
++1. **Cheap first, expensive last.** Classification is pure-Python heuristics
++   (regex + tool-name matching). It runs in microseconds and never blocks.
++2. **Read-only is free.** Pure inspection tools (read_file, ls, grep, list)
++   are TRIVIAL — no plan needed. The LLM's intelligence is not bottlenecked
++   by framework overhead for safe operations.
++3. **Side-effects escalate.** Anything that writes, executes, sends, or
++   deletes is at least STANDARD. Anything irreversible (rm -rf, force push,
++   drop table, send email to many recipients) is CONSEQUENTIAL or
++   IRREVERSIBLE.
++4. **Conservative on unknowns.** If we cannot prove an action is safe, we
++   treat it as STANDARD so the reasoning protocol at least runs a brief
++   plan. False-positive caution is cheap; false-negative recklessness is
++   expensive.
++
++The four decision classes map to behavior in ReasoningProtocol:
++
++    TRIVIAL        → execute immediately, no plan
++    STANDARD       → brief plan (goal + approach), execute
++    CONSEQUENTIAL  → full plan (goal + approach + risks + reversibility),
++                     self-critique, execute if sound
++    IRREVERSIBLE   → full plan + critique + explicit acknowledgement of
++                     irreversibility. Auto-execute only if user has trusted
++                     the agent (config flag); otherwise surface to user.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from enum import IntEnum
++from typing import Any
++
++
++class DecisionClass(IntEnum):
++    """How much reasoning an action deserves. Higher = more reasoning."""
++
++    TRIVIAL = 0
++    STANDARD = 10
++    CONSEQUENTIAL = 20
++    IRREVERSIBLE = 30
++
++
++# Tool-name patterns that are pure read-only (no state change).
++_READ_ONLY_TOOL_PATTERNS = (
++    re.compile(r"^read", re.IGNORECASE),
++    re.compile(r"^list", re.IGNORECASE),
++    re.compile(r"^ls$", re.IGNORECASE),
++    re.compile(r"^grep", re.IGNORECASE),
++    re.compile(r"^glob", re.IGNORECASE),
++    re.compile(r"^find", re.IGNORECASE),
++    re.compile(r"^stat", re.IGNORECASE),
++    re.compile(r"^head", re.IGNORECASE),
++    re.compile(r"^tail", re.IGNORECASE),
++    re.compile(r"^cat", re.IGNORECASE),
++    re.compile(r"^wc", re.IGNORECASE),
++    re.compile(r"^unified_recall", re.IGNORECASE),
++    re.compile(r"^unified_reflexion_list", re.IGNORECASE),
++    re.compile(r"^unified_framework_status", re.IGNORECASE),
++    re.compile(r"^reasoning_", re.IGNORECASE),
++    re.compile(r"search", re.IGNORECASE),  # web_search, file_search, tool_search
++    re.compile(r"status", re.IGNORECASE),
++)
++
++# Tool-name patterns that always execute something (commands, code).
++_EXECUTE_TOOL_PATTERNS = (
++    re.compile(r"^bash", re.IGNORECASE),
++    re.compile(r"^sh$", re.IGNORECASE),
++    re.compile(r"^shell", re.IGNORECASE),
++    re.compile(r"^execute", re.IGNORECASE),
++    re.compile(r"^terminal", re.IGNORECASE),
++    re.compile(r"^run", re.IGNORECASE),
++    re.compile(r"^subprocess", re.IGNORECASE),
++)
++
++# Tool-name patterns that send data outside the sandbox (irreversible-ish).
++_SEND_TOOL_PATTERNS = (
++    re.compile(r"^send", re.IGNORECASE),
++    re.compile(r"^publish", re.IGNORECASE),
++    re.compile(r"^deploy", re.IGNORECASE),
++    re.compile(r"^push", re.IGNORECASE),
++    re.compile(r"^email", re.IGNORECASE),
++    re.compile(r"^message", re.IGNORECASE),
++    re.compile(r"^notify", re.IGNORECASE),
++)
++
++# Argument-value regex patterns that signal IRREVERSIBLE operations
++# regardless of tool name. These are the catastrophic patterns that
++# unlimited mode disabled — we re-enable them as *classification signals*
++# (not blocks). The LLM is given a chance to justify them; if it can't,
++# the framework asks the user.
++_IRREVERSIBLE_VALUE_PATTERNS = (
++    re.compile(r"\brm\s+-rf?\s+/(?:\s|$|[^/\s])", re.IGNORECASE),  # rm -rf /<path>
++    re.compile(r"\bmkfs\.", re.IGNORECASE),
++    re.compile(r"\bdd\s+if=.*of=/dev/", re.IGNORECASE),
++    re.compile(r":\(\)\s*\{\s*:\|:&\s*\}\s*;:", re.IGNORECASE),  # fork bomb
++    re.compile(r"\bchmod\s+-R\s+[0-7]{3,4}\s+/(?:\s|$)", re.IGNORECASE),
++    re.compile(r"\bchown\s+-R\s+\S+\s+/(?:\s|$)", re.IGNORECASE),
++    re.compile(r"\bgit\s+push\s+.*--force", re.IGNORECASE),
++    re.compile(r"\bDROP\s+(TABLE|DATABASE|SCHEMA)\b", re.IGNORECASE),
++    re.compile(r"\bTRUNCATE\s+(TABLE|DATABASE)\b", re.IGNORECASE),
++    re.compile(r"\bDELETE\s+FROM\s+\w+\s*;(?:\s|$)", re.IGNORECASE),  # unfiltered DELETE
++    re.compile(r"\bshutdown\b", re.IGNORECASE),
++    re.compile(r"\breboot\b", re.IGNORECASE),
++    re.compile(r"\bhalt\b", re.IGNORECASE),
++    re.compile(r"\bpoweroff\b", re.IGNORECASE),
++)
++
++# Argument-value patterns that signal CONSEQUENTIAL (significant but
++# potentially reversible) operations.
++_CONSEQUENTIAL_VALUE_PATTERNS = (
++    re.compile(r"\brm\s+-r", re.IGNORECASE),  # rm -r but not -rf /<root>
++    re.compile(r"\bgit\s+push\b", re.IGNORECASE),
++    re.compile(r"\bgit\s+reset\s+--hard", re.IGNORECASE),
++    re.compile(r"\bsudo\b", re.IGNORECASE),
++    re.compile(r"\bapt(?:-get)?\s+install", re.IGNORECASE),
++    re.compile(r"\bpip\s+install", re.IGNORECASE),
++    re.compile(r"\bnpm\s+install", re.IGNORECASE),
++    re.compile(r"\buv\s+(pip\s+)?install", re.IGNORECASE),
++    re.compile(r"\bCREATE\s+(TABLE|DATABASE|INDEX)\b", re.IGNORECASE),
++    re.compile(r"\bALTER\s+TABLE\b", re.IGNORECASE),
++    re.compile(r"\bINSERT\s+INTO\b", re.IGNORECASE),
++    re.compile(r"\bUPDATE\s+\w+\s+SET\b", re.IGNORECASE),
++    re.compile(r"\bwget\b", re.IGNORECASE),
++    re.compile(r"\bcurl\s+.*\|\s*(?:sh|bash)", re.IGNORECASE),  # pipe to shell
++)
++
++
++@dataclass(frozen=True)
++class Classification:
++    """Result of classifying a tool call."""
++
++    cls: DecisionClass
++    reason: str
++    matched_pattern: str = ""
++
++    @property
++    def is_trivial(self) -> bool:
++        return self.cls is DecisionClass.TRIVIAL
++
++    @property
++    def requires_plan(self) -> bool:
++        return self.cls >= DecisionClass.STANDARD
++
++    @property
++    def requires_critique(self) -> bool:
++        return self.cls >= DecisionClass.CONSEQUENTIAL
++
++    @property
++    def requires_acknowledgement(self) -> bool:
++        return self.cls is DecisionClass.IRREVERSIBLE
++
++
++class DecisionFramework:
++    """Classify a tool call into a DecisionClass.
++
++    Stateless and side-effect free. Safe to call from any thread.
++    """
++
++    def classify(self, tool_name: str, args: dict[str, Any] | None) -> Classification:
++        name = (tool_name or "").strip()
++        safe_args = args if isinstance(args, dict) else {}
++
++        # 1. Check argument values for IRREVERSIBLE patterns first — these
++        #    override everything else because the value itself is the risk,
++        #    not the tool name.
++        for key, value in safe_args.items():
++            text = self._stringify(value)
++            if not text:
++                continue
++            for pattern in _IRREVERSIBLE_VALUE_PATTERNS:
++                match = pattern.search(text)
++                if match:
++                    return Classification(
++                        cls=DecisionClass.IRREVERSIBLE,
++                        reason=f"Argument {key!r} matched irreversible pattern: {pattern.pattern}",
++                        matched_pattern=pattern.pattern,
++                    )
++
++        # 2. Check argument values for CONSEQUENTIAL patterns.
++        for key, value in safe_args.items():
++            text = self._stringify(value)
++            if not text:
++                continue
++            for pattern in _CONSEQUENTIAL_VALUE_PATTERNS:
++                match = pattern.search(text)
++                if match:
++                    return Classification(
++                        cls=DecisionClass.CONSEQUENTIAL,
++                        reason=f"Argument {key!r} matched consequential pattern: {pattern.pattern}",
++                        matched_pattern=pattern.pattern,
++                    )
++
++        # 3. Tool-name based classification.
++        # 3a. Send/publish/deploy tools → CONSEQUENTIAL (external side effects).
++        for pattern in _SEND_TOOL_PATTERNS:
++            if pattern.search(name):
++                return Classification(
++                    cls=DecisionClass.CONSEQUENTIAL,
++                    reason=f"Tool name {name!r} matches send/deploy pattern",
++                    matched_pattern=pattern.pattern,
++                )
++
++        # 3b. Execute/bash/run tools → STANDARD (unless args escalated above).
++        for pattern in _EXECUTE_TOOL_PATTERNS:
++            if pattern.search(name):
++                return Classification(
++                    cls=DecisionClass.STANDARD,
++                    reason=f"Tool name {name!r} matches execute pattern",
++                    matched_pattern=pattern.pattern,
++                )
++
++        # 3c. Read-only tools → TRIVIAL.
++        for pattern in _READ_ONLY_TOOL_PATTERNS:
++            if pattern.search(name):
++                return Classification(
++                    cls=DecisionClass.TRIVIAL,
++                    reason=f"Tool name {name!r} matches read-only pattern",
++                    matched_pattern=pattern.pattern,
++                )
++
++        # 4. Default: STANDARD. Conservative — better to plan once too many
++        #    than once too few. The plan is cheap (single LLM call) and the
++        #    LLM can self-short-circuit if the action is obviously safe.
++        return Classification(
++            cls=DecisionClass.STANDARD,
++            reason="Unknown tool — defaulting to STANDARD (brief plan)",
++        )
++
++    @staticmethod
++    def _stringify(value: Any) -> str:
++        if value is None:
++            return ""
++        if isinstance(value, str):
++            return value
++        if isinstance(value, (list, tuple)):
++            return " ".join(str(item) for item in value)
++        try:
++            import json
++
++            return json.dumps(value, ensure_ascii=False, default=str)
++        except Exception:
++            return str(value)
+diff --git a/agent/unified/integration.py b/agent/unified/integration.py
+index 955971b..16ed9ab 100644
+--- a/agent/unified/integration.py
++++ b/agent/unified/integration.py
+@@ -2,6 +2,11 @@
+ 
+ This module is called from Hermes' core tool dispatcher and exposes vendored
+ OmniAgent/AgentScope packages through a stable Hermes-native integration layer.
++
++v1 extension: this module now also orchestrates the Reasoning Protocol
++(plan → critique → execute → reflect) and the Smart Guardian (LLM-as-judge).
++Both are opt-in via config; when disabled, behavior is identical to the
++legacy integration (pattern-based guardian + reflexion-on-failure only).
+ """
+ 
+ from __future__ import annotations
+@@ -12,13 +17,28 @@ from pathlib import Path
+ from typing import Any
+ 
+ from .config import load_unified_config
++from .decision import Classification, DecisionClass, DecisionFramework
+ from .events import EventBus
+ from .policy import Decision, PolicyEngine
++from .reasoning import ReasoningPlan, ReasoningProtocol, configure_protocol, get_protocol
+ from .reflexion import ReflexionRecord, ReflexionStore, record_from_tool_failure
++from .smart_guardian import (
++    GuardianVerdict,
++    RiskAssessment,
++    SmartGuardian,
++    configure_guardian,
++    get_guardian,
++)
+ 
+ _bus = EventBus()
+ _policy: PolicyEngine | None = None
+ _store: ReflexionStore | None = None
++_decider = DecisionFramework()
++# Per-tool-call state, keyed by tool_call_id, so after_tool_call can find
++# the plan made by before_tool_call. Bounded; cleared on session start.
++_pending_plans: dict[str, ReasoningPlan] = {}
++_pending_classifications: dict[str, Classification] = {}
++_pending_verdicts: dict[str, RiskAssessment] = {}
+ 
+ 
+ def enabled() -> bool:
+@@ -71,30 +91,173 @@ def before_tool_call(
+     turn_id: str = "",
+     api_request_id: str = "",
+ ) -> str | None:
+-    """Run unified guardian checks before Hermes executes a tool."""
++    """Run unified guardian checks before Hermes executes a tool.
++
++    Pipeline (in order, fail-open at every step):
++        1. Pattern-based PolicyEngine (legacy). Blocks catastrophic patterns
++           like rm -rf /, fork bomb, mkfs, etc. Zero LLM cost.
++        2. DecisionFramework classifies the action (TRIVIAL/STANDARD/
++           CONSEQUENTIAL/IRREVERSIBLE).
++        3. If reasoning_enabled AND classification requires a plan,
++           ReasoningProtocol.plan() generates one. Persisted for
++           after_tool_call to use.
++        4. If smart_guardian_enabled AND classification is CONSEQUENTIAL+,
++           SmartGuardian.assess() runs the LLM judge. Verdict may BLOCK
++           or REQUIRE_USER_CONFIRM.
++        5. If hard_block_irreversible AND classification is IRREVERSIBLE,
++           BLOCK unconditionally (hard floor).
++    """
+ 
+     cfg = load_unified_config()
+-    if not cfg.enabled or not cfg.guardian_enabled:
++    if not cfg.enabled:
+         return None
++
++    # ----- Step 1: Pattern-based PolicyEngine (legacy) -----
++    if cfg.guardian_enabled:
++        try:
++            decision = get_policy().evaluate(tool_name, args or {})
++            _bus.emit(
++                "tool.policy",
++                {
++                    "tool_name": tool_name,
++                    "decision": decision.decision.value,
++                    "rule": decision.rule,
++                    "task_id": task_id,
++                    "tool_call_id": tool_call_id,
++                    "api_request_id": api_request_id,
++                },
++                session_id=session_id or "",
++                turn_id=turn_id or "",
++            )
++            if decision.decision == Decision.BLOCK:
++                return decision.message
++        except Exception:
++            pass  # fail open
++
++    # ----- Step 2: Classification -----
++    try:
++        classification = _decider.classify(tool_name, args)
++    except Exception:
++        classification = Classification(
++            cls=DecisionClass.STANDARD, reason="classifier failed"
++        )
++    if tool_call_id:
++        _pending_classifications[tool_call_id] = classification
++        _prune_pending()
++
++    # Emit classification event for observability.
+     try:
+-        decision = get_policy().evaluate(tool_name, args or {})
+         _bus.emit(
+-            "tool.policy",
++            "tool.classify",
+             {
+                 "tool_name": tool_name,
+-                "decision": decision.decision.value,
+-                "rule": decision.rule,
+-                "task_id": task_id,
++                "classification": classification.cls.name,
++                "reason": classification.reason,
+                 "tool_call_id": tool_call_id,
+-                "api_request_id": api_request_id,
+             },
+             session_id=session_id or "",
+             turn_id=turn_id or "",
+         )
+-        if decision.decision == Decision.BLOCK:
+-            return decision.message
+     except Exception:
+-        return None
++        pass
++
++    # ----- Step 3: Reasoning Protocol (plan + critique) -----
++    plan: ReasoningPlan | None = None
++    if cfg.reasoning_enabled and classification.requires_plan:
++        try:
++            plan = get_protocol().plan(
++                tool_name=tool_name,
++                args=args,
++                classification=classification,
++            )
++            if plan is not None and tool_call_id:
++                _pending_plans[tool_call_id] = plan
++                _prune_pending()
++            # Emit the plan so TUI/gateway can display it.
++            if plan is not None:
++                _bus.emit(
++                    "reasoning.plan",
++                    {
++                        "tool_name": tool_name,
++                        "decision": plan.decision,
++                        "goal_preview": plan.goal[:200],
++                        "tool_call_id": tool_call_id,
++                    },
++                    session_id=session_id or "",
++                    turn_id=turn_id or "",
++                )
++            # If the plan itself says "abort", respect that.
++            if plan is not None and plan.decision == "abort":
++                return (
++                    f"Reasoning protocol aborted the action: {plan.rationale or 'no rationale given'}. "
++                    f"Plan goal: {plan.goal}"
++                )
++            # If the plan says "ask_user", surface that — the conversation
++            # loop is responsible for actually pausing; we just return a
++            # message that the LLM will see and can choose to surface.
++            if plan is not None and plan.decision == "ask_user":
++                return (
++                    f"Reasoning protocol recommends asking the user before proceeding: "
++                    f"{plan.rationale or plan.goal}"
++                )
++        except Exception:
++            plan = None  # fail open
++
++    # ----- Step 4: Smart Guardian (LLM judge) -----
++    if cfg.smart_guardian_enabled and classification.requires_critique:
++        try:
++            verdict = get_guardian().assess(
++                tool_name=tool_name,
++                args=args,
++                plan=plan,
++                classification=classification,
++            )
++            if tool_call_id:
++                _pending_verdicts[tool_call_id] = verdict
++                _prune_pending()
++            _bus.emit(
++                "guardian.verdict",
++                {
++                    "tool_name": tool_name,
++                    "verdict": verdict.verdict.value,
++                    "risk_level": verdict.risk_level,
++                    "reasoning_preview": verdict.reasoning[:200],
++                    "cache_hit": verdict.cache_hit,
++                    "tool_call_id": tool_call_id,
++                },
++                session_id=session_id or "",
++                turn_id=turn_id or "",
++            )
++            if verdict.verdict is GuardianVerdict.BLOCK:
++                return (
++                    f"Smart Guardian blocked this action: {verdict.reasoning}. "
++                    f"Risk level: {verdict.risk_level}."
++                )
++            if verdict.verdict is GuardianVerdict.REQUIRE_USER_CONFIRM:
++                return (
++                    f"Smart Guardian requires user confirmation: {verdict.reasoning}. "
++                    f"Risk level: {verdict.risk_level}."
++                )
++        except Exception:
++            pass  # fail open
++
++    # ----- Step 5: Hard floor for IRREVERSIBLE actions -----
++    if cfg.hard_block_irreversible and classification.requires_acknowledgement:
++        # The hard floor: even if the LLM judge allowed it, IRREVERSIBLE
++        # actions must go through reasoning_decide tool (which the LLM
++        # can choose to call) or be explicitly acknowledged. We don't
++        # BLOCK outright — we return a message that surfaces the
++        # irreversibility and lets the LLM decide to either call
++        # reasoning_decide or pick a safer alternative.
++        return (
++            f"Action classified as IRREVERSIBLE ({classification.reason}). "
++            "Hard-block floor is active. To proceed, call the `reasoning_decide` "
++            "tool with `acknowledged_irreversible=true` and a rationale, OR "
++            "choose a safer alternative. This protection is intentional — "
++            "set `unified.smart_guardian.hard_block_irreversible: false` to "
++            "disable it (Codex-style autonomy)."
++        )
++
+     return None
+ 
+ 
+@@ -110,11 +273,19 @@ def after_tool_call(
+     turn_id: str = "",
+     api_request_id: str = "",
+ ) -> None:
+-    """Record tool events and extract reflexion lessons after execution."""
++    """Record tool events, extract reflexion lessons, and run reflection."""
+ 
+     cfg = load_unified_config()
+     if not cfg.enabled:
+         return
++
++    # Recover per-call state saved by before_tool_call.
++    plan = _pending_plans.pop(tool_call_id, None) if tool_call_id else None
++    classification = (
++        _pending_classifications.pop(tool_call_id, None) if tool_call_id else None
++    )
++    verdict = _pending_verdicts.pop(tool_call_id, None) if tool_call_id else None
++
+     try:
+         _bus.emit(
+             "tool.finish",
+@@ -125,29 +296,94 @@ def after_tool_call(
+                 "task_id": task_id,
+                 "tool_call_id": tool_call_id,
+                 "api_request_id": api_request_id,
++                "classification": classification.cls.name if classification else None,
++                "verdict": verdict.verdict.value if verdict else None,
+             },
+             session_id=session_id or "",
+             turn_id=turn_id or "",
+         )
+-        if not cfg.reflexion_enabled:
+-            return
+-        record = record_from_tool_failure(
+-            tool_name=tool_name,
+-            args=args,
+-            result=result,
+-            session_id=session_id or "",
+-            turn_id=turn_id or "",
+-            scope=current_scope(),
+-        )
+-        if record is not None and get_store().add(record):
+-            _bus.emit(
+-                "reflexion.add",
+-                {"tool_name": tool_name, "lesson": record.lesson[:300], "record_id": record.record_id},
+-                session_id=record.session_id,
+-                turn_id=record.turn_id,
+-            )
+     except Exception:
+-        return
++        pass
++
++    # Legacy: extract reflexion record from tool failure (always runs
++    # when reflexion is enabled, regardless of reasoning protocol).
++    if cfg.reflexion_enabled:
++        try:
++            record = record_from_tool_failure(
++                tool_name=tool_name,
++                args=args,
++                result=result,
++                session_id=session_id or "",
++                turn_id=turn_id or "",
++                scope=current_scope(),
++            )
++            if record is not None and get_store().add(record):
++                _bus.emit(
++                    "reflexion.add",
++                    {"tool_name": tool_name, "lesson": record.lesson[:300], "record_id": record.record_id},
++                    session_id=record.session_id,
++                    turn_id=record.turn_id,
++                )
++        except Exception:
++            pass
++
++    # New: reasoning reflection. Only when reasoning_enabled AND a plan
++    # was made for this call. The reflection is persisted into the
++    # reflexion store as a separate record type, so future similar
++    # situations can recall both failure lessons AND reasoning lessons.
++    if cfg.reasoning_enabled and cfg.persist_reflections and plan is not None:
++        try:
++            reflection = get_protocol().reflect(
++                plan=plan,
++                tool_name=tool_name,
++                args=args,
++                result=result,
++                duration_ms=duration_ms,
++            )
++            if reflection is not None and reflection.lesson:
++                from .reflexion import ReflexionRecord
++
++                refl_record = ReflexionRecord(
++                    lesson=reflection.lesson,
++                    source="reasoning_reflection",
++                    score=reflection.score,
++                    tags=["reflection", "reasoning"]
++                    + (["outcome_mismatch"] if not reflection.outcome_matched else []),
++                    session_id=session_id or "",
++                    turn_id=turn_id or "",
++                    tool_name=tool_name,
++                    scope=current_scope(),
++                )
++                if get_store().add(refl_record):
++                    _bus.emit(
++                        "reflexion.add",
++                        {
++                            "tool_name": tool_name,
++                            "lesson": reflection.lesson[:300],
++                            "record_id": refl_record.record_id,
++                            "outcome_matched": reflection.outcome_matched,
++                        },
++                        session_id=session_id or "",
++                        turn_id=turn_id or "",
++                    )
++        except Exception:
++            pass
++
++
++def _prune_pending(max_size: int = 256) -> None:
++    """Bound the per-call state dicts so they can't grow unbounded.
++
++    Each entry is small (a few hundred bytes), so 256 entries ≈ 100KB
++    worst case. We evict oldest by insertion order (dict preserves it).
++    """
++    for table in (_pending_plans, _pending_classifications, _pending_verdicts):
++        while len(table) > max_size:
++            # pop first inserted key
++            try:
++                first_key = next(iter(table))
++                table.pop(first_key, None)
++            except StopIteration:
++                break
+ 
+ 
+ def recall_context(query: str, *, limit: int = 5, scope: str | None = None) -> str:
+@@ -225,6 +461,13 @@ def framework_status() -> dict[str, Any]:
+         "guardian_enabled": cfg.guardian_enabled,
+         "reflexion_enabled": cfg.reflexion_enabled,
+         "auto_prefetch_enabled": cfg.auto_prefetch_enabled,
++        # v1 extension status
++        "reasoning_enabled": cfg.reasoning_enabled,
++        "smart_guardian_enabled": cfg.smart_guardian_enabled,
++        "hard_block_irreversible": cfg.hard_block_irreversible,
++        "persist_reflections": cfg.persist_reflections,
++        "reasoning_protocol_wired": get_protocol()._llm_call is not None,
++        "smart_guardian_wired": get_guardian()._llm_call is not None,
+         "scope": current_scope(),
+         "store": str(cfg.store_path),
+         "vendored": {
+@@ -236,3 +479,55 @@ def framework_status() -> dict[str, Any]:
+ 
+ def status_tool(args: dict[str, Any], **_: Any) -> str:
+     return json.dumps(framework_status(), ensure_ascii=False)
++
++
++# --------------------------------------------------------------------------- #
++# Public configuration API
++# --------------------------------------------------------------------------- #
++# These functions are called by Hermes' setup path once the LLM client is
++# available, so that the reasoning protocol and smart guardian can use
++# real LLM calls instead of the no-LLM fallback.
++#
++# Typical wiring (in hermes_cli/setup.py or agent/conversation_loop.py):
++#
++#     from agent.unified.integration import configure_reasoning_stack
++#
++#     def llm_call(system_prompt, user_prompt):
++#         return my_llm_client.chat(system=system_prompt, user=user_prompt)
++#
++#     configure_reasoning_stack(llm_call=llm_call)
++
++
++def configure_reasoning_stack(
++    *,
++    llm_call=None,
++    conversation_context_provider=None,
++) -> None:
++    """Wire the LLM client into the reasoning protocol and smart guardian.
++
++    Idempotent. Safe to call multiple times (e.g., once at startup, again
++    when the user changes models via `hermes model`).
++
++    Args:
++        llm_call: callable(system_prompt: str, user_prompt: str) -> str.
++            Must return the raw model output as a string. Should NOT
++            raise on transient errors — the protocol handles that.
++        conversation_context_provider: callable() -> str. Returns a brief
++            summary of recent conversation context for the planning prompt.
++            Should be cheap (cached/summarized); the protocol calls it
++            on every consequential action.
++    """
++    if llm_call is None:
++        return  # nothing to wire
++
++    cfg = load_unified_config()
++    configure_protocol(
++        llm_call=llm_call,
++        conversation_context_provider=conversation_context_provider,
++    )
++    configure_guardian(
++        llm_call=llm_call,
++        reflexion_recall=recall_context,
++        cache_size=cfg.guardian_cache_size,
++        cache_ttl_seconds=cfg.guardian_cache_ttl_seconds,
++    )
+diff --git a/agent/unified/reasoning.py b/agent/unified/reasoning.py
+new file mode 100644
+index 0000000..95593af
+--- /dev/null
++++ b/agent/unified/reasoning.py
+@@ -0,0 +1,472 @@
++"""Reasoning Protocol — forces the agent to think before it acts.
++
++This is the core change that turns Hermes-Omni from a "tool-dispatch loop"
++into a "reasoning-first agent". The protocol has four phases:
++
++    ┌─────────┐     ┌──────────┐     ┌─────────┐     ┌──────────┐
++    │  PLAN   │ ──▶ │ CRITIQUE │ ──▶ │ EXECUTE │ ──▶ │ REFLECT  │
++    └─────────┘     └──────────┘     └─────────┘     └──────────┘
++
++Design goals
++------------
++1. **Don't bottleneck the LLM.** Plans are generated by the LLM itself,
++   through a single function call. No multi-turn scaffolding, no chained
++   prompts. One call, one plan.
++2. **Match plan depth to action consequence.** A `read_file` is TRIVIAL —
++   skip planning entirely. A `git push --force` is IRREVERSIBLE — generate
++   a full plan AND a critique AND require explicit acknowledgement.
++3. **Never block — escalate.** The protocol does not refuse actions. It
++   returns structured reasoning that the conversation loop can choose to
++   present to the user, log, or proceed. The LLM is the judge, not the
++   framework.
++4. **Fail open, not closed.** If the LLM call fails (network, quota, etc.),
++   the protocol degrades to the legacy path: execute the tool. Better to
++   execute one risky action than to brick the agent entirely.
++
++Why not just rely on the LLM's chain-of-thought?
++------------------------------------------------
++Top-tier LLMs (Claude Opus, GPT-5, GLM-4.6, DeepSeek R1) already reason
++well internally. But:
++
++- Not all models do. The framework should support any model the user picks.
++- Internal CoT is invisible to the framework, so the framework cannot
++  learn from it, recall it, or surface it to the user.
++- The protocol gives the framework a *structured* reasoning artifact that
++  can be persisted, recalled, and audited. This is what makes the agent
++  self-improving across sessions.
++
++The protocol is therefore NOT a replacement for the LLM's own reasoning —
++it's a structured surface that *captures* that reasoning for downstream
++use (reflexion, recall, user display, audit log).
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from dataclasses import asdict, dataclass, field
++from typing import Any, Literal
++
++from .decision import Classification, DecisionClass, DecisionFramework
++
++
++# --------------------------------------------------------------------------- #
++# Data structures
++# --------------------------------------------------------------------------- #
++
++
++@dataclass
++class ReasoningPlan:
++    """Structured plan generated before an action."""
++
++    tool_name: str
++    args_summary: str
++    goal: str
++    approach: str
++    alternatives: str
++    risks: str
++    reversibility: str
++    decision: Literal["proceed", "abort", "ask_user"]
++    rationale: str
++    classification: str
++    created_at: float = field(default_factory=time.time)
++    elapsed_ms: int = 0
++
++    def as_prompt_block(self) -> str:
++        """Render as a markdown block suitable for inclusion in conversation."""
++        lines = [
++            "<reasoning-plan>",
++            f"tool: {self.tool_name}",
++            f"classification: {self.classification}",
++            f"goal: {self.goal}",
++            f"approach: {self.approach}",
++        ]
++        if self.alternatives:
++            lines.append(f"alternatives: {self.alternatives}")
++        if self.risks:
++            lines.append(f"risks: {self.risks}")
++        if self.reversibility:
++            lines.append(f"reversibility: {self.reversibility}")
++        lines.append(f"decision: {self.decision}")
++        if self.rationale:
++            lines.append(f"rationale: {self.rationale}")
++        lines.append("</reasoning-plan>")
++        return "\n".join(lines)
++
++
++@dataclass
++class ReasoningCritique:
++    """Self-critique of a plan. Only generated for CONSEQUENTIAL+ actions."""
++
++    blind_spots: str
++    assumptions_verified: str
++    assumptions_invalid: str
++    recommendation: Literal["proceed", "modify", "abort"]
++    modified_approach: str = ""
++    created_at: float = field(default_factory=time.time)
++    elapsed_ms: int = 0
++
++
++@dataclass
++class ReasoningReflection:
++    """Post-action reflection. Persisted into the reflexion store."""
++
++    tool_name: str
++    outcome_matched: bool
++    expected: str
++    actual: str
++    lesson: str
++    score: float = 1.0  # higher = more valuable lesson
++    created_at: float = field(default_factory=time.time)
++
++
++# --------------------------------------------------------------------------- #
++# Plan generation prompts
++# --------------------------------------------------------------------------- #
++
++_PLAN_SYSTEM_PROMPT = (
++    "You are the reasoning layer of an AI agent. Your job is to produce a "
++    "structured plan before the agent executes a tool. Be concise, honest, "
++    "and specific. Do not pad. If the action is safe, say so briefly. If "
++    "the action is risky, articulate the risk precisely.\n\n"
++    "Return STRICT JSON only — no prose, no markdown fences. Schema:\n"
++    "{\n"
++    '  "goal": "what this action is supposed to achieve",\n'
++    '  "approach": "how this tool call achieves the goal",\n'
++    '  "alternatives": "other viable approaches, or empty string if none",\n'
++    '  "risks": "what could go wrong, or empty string if nothing notable",\n'
++    '  "reversibility": "can this be undone? how?",\n'
++    '  "decision": "proceed" | "abort" | "ask_user",\n'
++    '  "rationale": "one-sentence justification for the decision"\n'
++    "}"
++)
++
++_CRITIQUE_SYSTEM_PROMPT = (
++    "You are the self-critique layer of an AI agent. You are given a plan "
++    "for a consequential or irreversible action. Your job is to find blind "
++    "spots, verify or invalidate assumptions, and recommend whether to "
++    "proceed. Be skeptical but not paranoid.\n\n"
++    "Return STRICT JSON only. Schema:\n"
++    "{\n"
++    '  "blind_spots": "what the plan missed",\n'
++    '  "assumptions_verified": "assumptions the plan made that are correct",\n'
++    '  "assumptions_invalid": "assumptions the plan made that are wrong, or empty",\n'
++    '  "recommendation": "proceed" | "modify" | "abort",\n'
++    '  "modified_approach": "if recommendation=modify, describe the change"\n'
++    "}"
++)
++
++_REFLECT_SYSTEM_PROMPT = (
++    "You are the reflection layer of an AI agent. Compare the expected "
++    "outcome of a tool call to the actual outcome, and extract a lesson "
++    "that will be useful for future similar situations. Be specific — "
++    "generic lessons like 'be careful' are useless.\n\n"
++    "Return STRICT JSON only. Schema:\n"
++    "{\n"
++    '  "outcome_matched": true | false,\n'
++    '  "expected": "what the plan expected",\n'
++    '  "actual": "what actually happened (brief)",\n'
++    '  "lesson": "the transferable lesson, or empty if nothing notable",\n'
++    '  "score": 0.0 to 5.0 — how valuable is this lesson for future use?\n'
++    "}"
++)
++
++
++# --------------------------------------------------------------------------- #
++# Plan argument formatting
++# --------------------------------------------------------------------------- #
++
++
++def _summarize_args(args: dict[str, Any] | None, *, max_chars: int = 800) -> str:
++    if not args:
++        return "(no arguments)"
++    try:
++        text = json.dumps(args, ensure_ascii=False, default=str)
++    except Exception:
++        text = str(args)
++    if len(text) <= max_chars:
++        return text
++    return text[:max_chars] + f"…<truncated, {len(text) - max_chars} more chars>"
++
++
++def _build_plan_user_prompt(
++    *,
++    tool_name: str,
++    args: dict[str, Any] | None,
++    classification: Classification,
++    conversation_context: str,
++) -> str:
++    return (
++        f"Tool: {tool_name}\n"
++        f"Classification: {classification.cls.name} — {classification.reason}\n"
++        f"Arguments: {_summarize_args(args)}\n\n"
++        f"Conversation context (brief):\n{conversation_context}\n\n"
++        "Produce the plan JSON now."
++    )
++
++
++def _build_critique_user_prompt(plan: ReasoningPlan, classification: Classification) -> str:
++    return (
++        f"Action classification: {classification.cls.name}\n"
++        f"Matched signal: {classification.reason}\n\n"
++        f"Plan to critique:\n{plan.as_prompt_block()}\n\n"
++        "Produce the critique JSON now."
++    )
++
++
++def _build_reflect_user_prompt(
++    *,
++    plan: ReasoningPlan,
++    tool_name: str,
++    args: dict[str, Any] | None,
++    result_preview: str,
++    duration_ms: int,
++) -> str:
++    return (
++        f"Plan that was made before the action:\n{plan.as_prompt_block()}\n\n"
++        f"Tool executed: {tool_name}\n"
++        f"Arguments: {_summarize_args(args)}\n"
++        f"Duration: {duration_ms} ms\n\n"
++        f"Actual result (truncated):\n{result_preview}\n\n"
++        "Produce the reflection JSON now."
++    )
++
++
++# --------------------------------------------------------------------------- #
++# The protocol
++# --------------------------------------------------------------------------- #
++
++
++class ReasoningProtocol:
++    """ Orchestrates plan → critique → execute → reflect.
++
++    The protocol is intentionally stateless across tool calls: each call to
++    `plan()`, `critique()`, `reflect()` is independent. The conversation
++    loop is responsible for stitching them together. This keeps the
++    protocol testable and side-effect free.
++
++    The protocol needs an LLM client to generate plans/critiques/reflections.
++    It accepts a `llm_call` callable that takes (system_prompt, user_prompt)
++    and returns a string. The framework supplies this; if none is supplied,
++    the protocol degrades to "no-plan mode" (executes without reasoning)
++    and logs a warning.
++    """
++
++    def __init__(
++        self,
++        *,
++        llm_call=None,
++        decision_framework: DecisionFramework | None = None,
++        conversation_context_provider=None,
++    ) -> None:
++        self._llm_call = llm_call
++        self._decider = decision_framework or DecisionFramework()
++        # conversation_context_provider() -> str (last N turns, summarized)
++        self._context_provider = conversation_context_provider or (lambda: "")
++
++    # ------------------------------------------------------------------ #
++    # Public API
++    # ------------------------------------------------------------------ #
++
++    def classify(self, tool_name: str, args: dict[str, Any] | None) -> Classification:
++        """Cheap pre-flight: how much reasoning does this action need?"""
++        return self._decider.classify(tool_name, args)
++
++    def plan(
++        self,
++        *,
++        tool_name: str,
++        args: dict[str, Any] | None,
++        classification: Classification,
++    ) -> ReasoningPlan | None:
++        """Generate a structured plan. Returns None if LLM is unavailable
++        or classification is TRIVIAL (skip planning entirely)."""
++        if classification.is_trivial:
++            return None
++        if self._llm_call is None:
++            return None
++        try:
++            user_prompt = _build_plan_user_prompt(
++                tool_name=tool_name,
++                args=args,
++                classification=classification,
++                conversation_context=self._context_provider(),
++            )
++            started = time.time()
++            raw = self._llm_call(_PLAN_SYSTEM_PROMPT, user_prompt)
++            elapsed = int((time.time() - started) * 1000)
++            data = self._parse_json(raw)
++            if data is None:
++                return None
++            return ReasoningPlan(
++                tool_name=tool_name,
++                args_summary=_summarize_args(args),
++                goal=str(data.get("goal", "")).strip(),
++                approach=str(data.get("approach", "")).strip(),
++                alternatives=str(data.get("alternatives", "")).strip(),
++                risks=str(data.get("risks", "")).strip(),
++                reversibility=str(data.get("reversibility", "")).strip(),
++                decision=str(data.get("decision", "proceed")).strip() or "proceed",
++                rationale=str(data.get("rationale", "")).strip(),
++                classification=classification.cls.name,
++                elapsed_ms=elapsed,
++            )
++        except Exception:
++            # Fail open: no plan → execute anyway. The conversation loop
++            # will see plan=None and proceed without reasoning overhead.
++            return None
++
++    def critique(
++        self,
++        *,
++        plan: ReasoningPlan,
++        classification: Classification,
++    ) -> ReasoningCritique | None:
++        """Self-critique the plan. Only called for CONSEQUENTIAL+ actions."""
++        if not classification.requires_critique:
++            return None
++        if self._llm_call is None:
++            return None
++        try:
++            user_prompt = _build_critique_user_prompt(plan, classification)
++            started = time.time()
++            raw = self._llm_call(_CRITIQUE_SYSTEM_PROMPT, user_prompt)
++            elapsed = int((time.time() - started) * 1000)
++            data = self._parse_json(raw)
++            if data is None:
++                return None
++            return ReasoningCritique(
++                blind_spots=str(data.get("blind_spots", "")).strip(),
++                assumptions_verified=str(data.get("assumptions_verified", "")).strip(),
++                assumptions_invalid=str(data.get("assumptions_invalid", "")).strip(),
++                recommendation=str(data.get("recommendation", "proceed")).strip() or "proceed",
++                modified_approach=str(data.get("modified_approach", "")).strip(),
++                elapsed_ms=elapsed,
++            )
++        except Exception:
++            return None
++
++    def reflect(
++        self,
++        *,
++        plan: ReasoningPlan | None,
++        tool_name: str,
++        args: dict[str, Any] | None,
++        result: Any,
++        duration_ms: int = 0,
++    ) -> ReasoningReflection | None:
++        """Post-action reflection. Returns None if no plan was made or LLM unavailable."""
++        if plan is None or self._llm_call is None:
++            return None
++        try:
++            result_preview = self._preview(result)
++            user_prompt = _build_reflect_user_prompt(
++                plan=plan,
++                tool_name=tool_name,
++                args=args,
++                result_preview=result_preview,
++                duration_ms=duration_ms,
++            )
++            started = time.time()
++            raw = self._llm_call(_REFLECT_SYSTEM_PROMPT, user_prompt)
++            elapsed = int((time.time() - started) * 1000)
++            data = self._parse_json(raw)
++            if data is None:
++                return None
++            try:
++                score = float(data.get("score", 1.0))
++            except (TypeError, ValueError):
++                score = 1.0
++            return ReasoningReflection(
++                tool_name=tool_name,
++                outcome_matched=bool(data.get("outcome_matched", False)),
++                expected=str(data.get("expected", "")).strip(),
++                actual=str(data.get("actual", "")).strip(),
++                lesson=str(data.get("lesson", "")).strip(),
++                score=max(0.0, min(5.0, score)),
++                created_at=time.time(),
++            )
++        except Exception:
++            return None
++
++    # ------------------------------------------------------------------ #
++    # Helpers
++    # ------------------------------------------------------------------ #
++
++    @staticmethod
++    def _preview(value: Any, *, max_chars: int = 1500) -> str:
++        if value is None:
++            return "(no result)"
++        if isinstance(value, str):
++            text = value
++        else:
++            try:
++                text = json.dumps(value, ensure_ascii=False, default=str)
++            except Exception:
++                text = str(value)
++        if len(text) <= max_chars:
++            return text
++        return text[:max_chars] + f"…<truncated, {len(text) - max_chars} more chars>"
++
++    @staticmethod
++    def _parse_json(raw: str) -> dict[str, Any] | None:
++        if not raw:
++            return None
++        # Strip markdown fences if the model added them despite instructions.
++        text = raw.strip()
++        if text.startswith("```"):
++            lines = text.splitlines()
++            if lines and lines[0].startswith("```"):
++                lines = lines[1:]
++            if lines and lines[-1].startswith("```"):
++                lines = lines[:-1]
++            text = "\n".join(lines).strip()
++        # Try direct parse first.
++        try:
++            return json.loads(text)
++        except Exception:
++            pass
++        # Fallback: extract the largest {...} block.
++        start = text.find("{")
++        end = text.rfind("}")
++        if start >= 0 and end > start:
++            try:
++                return json.loads(text[start : end + 1])
++            except Exception:
++                return None
++        return None
++
++
++# --------------------------------------------------------------------------- #
++# Module-level singleton
++# --------------------------------------------------------------------------- #
++
++_protocol: ReasoningProtocol | None = None
++
++
++def get_protocol() -> ReasoningProtocol:
++    global _protocol
++    if _protocol is None:
++        _protocol = ReasoningProtocol()
++    return _protocol
++
++
++def configure_protocol(
++    *,
++    llm_call=None,
++    decision_framework: DecisionFramework | None = None,
++    conversation_context_provider=None,
++) -> ReasoningProtocol:
++    """Replace the global protocol with a configured one.
++
++    Called by Hermes' setup path once the LLM client is available, so that
++    subsequent tool calls can use real reasoning instead of the no-LLM
++    fallback.
++    """
++    global _protocol
++    _protocol = ReasoningProtocol(
++        llm_call=llm_call,
++        decision_framework=decision_framework,
++        conversation_context_provider=conversation_context_provider,
++    )
++    return _protocol
+diff --git a/agent/unified/smart_guardian.py b/agent/unified/smart_guardian.py
+new file mode 100644
+index 0000000..223e9cd
+--- /dev/null
++++ b/agent/unified/smart_guardian.py
+@@ -0,0 +1,358 @@
++r"""Smart Guardian — LLM-as-judge replacement for the pattern-based guardian.
++
++The legacy guardian (agent/guardian.py + agent/unified/policy.py) blocks
++actions using regex patterns. This is the wrong abstraction for a
++reasoning-first agent:
++
++- Regex cannot understand context. `rm -rf node_modules/` is safe;
++  `rm -rf /` is not. The pattern `rm\s+-rf` cannot tell them apart.
++- Regex cannot learn. Once written, the rules never improve.
++- Regex over-blocks creative workflows. A senior engineer doing
++  `git push --force` to their own branch knows what they're doing.
++
++The Smart Guardian inverts the model:
++
++- The PolicyEngine (pattern-based) still runs FIRST as a fast pre-filter
++  for known-catastrophic patterns (rm -rf /, fork bomb, mkfs, etc.).
++  These get BLOCKED at the pattern layer with zero LLM cost.
++- Anything that passes the pattern layer but is classified as
++  CONSEQUENTIAL or IRREVERSIBLE by the DecisionFramework gets sent to
++  the LLM judge for a context-aware risk assessment.
++- The judge sees: tool name, args, plan, classification reason, and the
++  most recent reflexion lessons for similar situations. It returns one
++  of: ALLOW / WARN / REQUIRE_USER_CONFIRM / BLOCK.
++- The judge's decision is cached by a content-hash of its inputs, so
++  repeated similar actions do not re-incur LLM cost.
++
++This is the bridge between "unlimited mode" (no safety at all) and
++"pattern-block mode" (regex can't reason). It gives the agent the
++*appearance* of unlimited autonomy while actually maintaining a
++context-aware safety net that scales with the LLM's intelligence.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import time
++from dataclasses import dataclass, field
++from enum import Enum
++from threading import RLock
++from typing import Any, Literal
++
++from .decision import Classification, DecisionClass
++from .reasoning import ReasoningPlan
++
++
++class GuardianVerdict(str, Enum):
++    """What the smart guardian decided about an action."""
++
++    ALLOW = "allow"  # proceed, no warning
++    WARN = "warn"  # proceed, but log/notify
++    REQUIRE_USER_CONFIRM = "require_user_confirm"  # pause and ask the user
++    BLOCK = "block"  # refuse; this is final
++
++
++@dataclass(frozen=True)
++class RiskAssessment:
++    """A single LLM-judge assessment."""
++
++    verdict: GuardianVerdict
++    risk_level: Literal["negligible", "low", "moderate", "high", "severe"]
++    reasoning: str
++    conditions: str  # if non-empty, action is allowed only if these conditions hold
++    similar_past_lessons: str  # what past reflexion said about similar actions
++    created_at: float = field(default_factory=time.time)
++    elapsed_ms: int = 0
++    cache_hit: bool = False
++    cache_key: str = ""
++
++    @property
++    def blocks(self) -> bool:
++        return self.verdict is GuardianVerdict.BLOCK
++
++    @property
++    def requires_user(self) -> bool:
++        return self.verdict is GuardianVerdict.REQUIRE_USER_CONFIRM
++
++
++_JUDGE_SYSTEM_PROMPT = (
++    "You are the Guardian of an autonomous AI agent. Your job is to "
++    "decide whether the agent should be allowed to execute a planned "
++    "action. You see the action, the agent's reasoning plan, the "
++    "classification rationale, and any relevant lessons from past "
++    "similar actions.\n\n"
++    "Be calibrated, not paranoid. The goal is to allow legitimate work "
++    "while preventing genuine disasters. A senior engineer would not "
++    "ask permission for `git push origin feature-branch`, but would "
++    "pause for `git push --force origin main`.\n\n"
++    "Return STRICT JSON only. Schema:\n"
++    "{\n"
++    '  "verdict": "allow" | "warn" | "require_user_confirm" | "block",\n'
++    '  "risk_level": "negligible" | "low" | "moderate" | "high" | "severe",\n'
++    '  "reasoning": "one or two sentences explaining the verdict",\n'
++    '  "conditions": "if non-empty, the action may proceed ONLY if these '
++    'conditions are true (e.g., \'branch is not main/master\')",\n'
++    '  "similar_past_lessons": "if past lessons informed this verdict, '
++    'briefly note how; otherwise empty"\n'
++    "}"
++)
++
++
++def _build_judge_user_prompt(
++    *,
++    tool_name: str,
++    args: dict[str, Any] | None,
++    plan: ReasoningPlan | None,
++    classification: Classification,
++    reflexion_context: str,
++) -> str:
++    plan_block = plan.as_prompt_block() if plan else "(no plan generated — classification was TRIVIAL or LLM unavailable)"
++    args_str = json.dumps(args, ensure_ascii=False, default=str) if args else "(no args)"
++    return (
++        f"Tool: {tool_name}\n"
++        f"Classification: {classification.cls.name} — {classification.reason}\n"
++        f"Arguments: {args_str}\n\n"
++        f"Plan:\n{plan_block}\n\n"
++        f"Relevant past lessons:\n{reflexion_context or '(none)'}\n\n"
++        "Return the verdict JSON now."
++    )
++
++
++def _cache_key(
++    *,
++    tool_name: str,
++    args: dict[str, Any] | None,
++    classification_reason: str,
++    plan_decision: str,
++) -> str:
++    """Stable content-hash for caching judge verdicts.
++
++    The cache key intentionally excludes the plan text itself (which
++    varies with LLM temperature) — only the plan's *decision* field is
++    included, so two plans with the same decision but different prose
++    share a cache entry.
++    """
++    parts = [
++        tool_name or "",
++        json.dumps(args or {}, ensure_ascii=False, default=str, sort_keys=True),
++        classification_reason,
++        plan_decision,
++    ]
++    raw = "\0".join(parts)
++    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:24]
++
++
++class SmartGuardian:
++    """LLM-as-judge guardian for CONSEQUENTIAL+ actions.
++
++    Lifecycle:
++        1. PolicyEngine (pattern-based) runs FIRST — handles known
++           catastrophic patterns with zero LLM cost.
++        2. DecisionFramework classifies the action.
++        3. If TRIVIAL or STANDARD, SmartGuardian returns ALLOW immediately.
++        4. If CONSEQUENTIAL or IRREVERSIBLE, SmartGuardian calls the LLM
++           judge (with caching).
++        5. If LLM unavailable, SmartGuardian degrades to ALLOW (fail open).
++
++    The cache is bounded (default 512 entries, LRU eviction). Verdicts
++    have a TTL (default 1 hour) so stale verdicts don't permanently
++    allow risky patterns.
++    """
++
++    def __init__(
++        self,
++        *,
++        llm_call=None,
++        reflexion_recall=None,
++        cache_size: int = 512,
++        cache_ttl_seconds: int = 3600,
++    ) -> None:
++        self._llm_call = llm_call
++        # reflexion_recall(query, limit) -> str (formatted lessons)
++        self._reflexion_recall = reflexion_recall or (lambda query, limit=3: "")
++        self._cache_size = max(8, cache_size)
++        self._cache_ttl = max(60, cache_ttl_seconds)
++        self._cache: dict[str, tuple[float, RiskAssessment]] = {}
++        self._lock = RLock()
++
++    def assess(
++        self,
++        *,
++        tool_name: str,
++        args: dict[str, Any] | None,
++        plan: ReasoningPlan | None,
++        classification: Classification,
++    ) -> RiskAssessment:
++        """Assess the risk of executing this action.
++
++        Always returns a RiskAssessment. Never raises.
++        """
++        # Fast path: TRIVIAL and STANDARD actions skip the judge entirely.
++        # The LLM judge is reserved for actions where the cost of a wrong
++        # decision exceeds the cost of an LLM call.
++        if classification.cls < DecisionClass.CONSEQUENTIAL:
++            return RiskAssessment(
++                verdict=GuardianVerdict.ALLOW,
++                risk_level="negligible" if classification.is_trivial else "low",
++                reasoning=f"Action classified as {classification.cls.name}; below guardian LLM-judge threshold.",
++                conditions="",
++                similar_past_lessons="",
++            )
++
++        # Fail open if no LLM available. We log this in the verdict so the
++        # conversation loop / user can see that safety was degraded.
++        if self._llm_call is None:
++            return RiskAssessment(
++                verdict=GuardianVerdict.WARN,
++                risk_level="moderate",
++                reasoning=(
++                    f"Action classified as {classification.cls.name} but no LLM "
++                    "judge is configured. Proceeding with degraded safety."
++                ),
++                conditions="",
++                similar_past_lessons="",
++            )
++
++        # Cache lookup.
++        key = _cache_key(
++            tool_name=tool_name,
++            args=args,
++            classification_reason=classification.reason,
++            plan_decision=(plan.decision if plan else "no_plan"),
++        )
++        with self._lock:
++            cached = self._cache.get(key)
++            if cached is not None:
++                ts, verdict = cached
++                if (time.time() - ts) <= self._cache_ttl:
++                    return RiskAssessment(
++                        verdict=verdict.verdict,
++                        risk_level=verdict.risk_level,
++                        reasoning=verdict.reasoning,
++                        conditions=verdict.conditions,
++                        similar_past_lessons=verdict.similar_past_lessons,
++                        elapsed_ms=0,
++                        cache_hit=True,
++                        cache_key=key,
++                    )
++                # expired
++                self._cache.pop(key, None)
++
++        # LLM judge call.
++        try:
++            reflexion_context = self._reflexion_recall(
++                f"{tool_name} {classification.matched_pattern}",
++                limit=3,
++            )
++            user_prompt = _build_judge_user_prompt(
++                tool_name=tool_name,
++                args=args,
++                plan=plan,
++                classification=classification,
++                reflexion_context=reflexion_context,
++            )
++            started = time.time()
++            raw = self._llm_call(_JUDGE_SYSTEM_PROMPT, user_prompt)
++            elapsed = int((time.time() - started) * 1000)
++            data = self._parse_json(raw)
++            if data is None:
++                # LLM returned garbage — fail open with a warning.
++                return RiskAssessment(
++                    verdict=GuardianVerdict.WARN,
++                    risk_level="moderate",
++                    reasoning="LLM judge returned unparseable output; proceeding with warning.",
++                    conditions="",
++                    similar_past_lessons="",
++                    elapsed_ms=elapsed,
++                )
++            verdict = GuardianVerdict(str(data.get("verdict", "allow")).strip().lower())
++            if verdict not in GuardianVerdict:
++                verdict = GuardianVerdict.WARN
++            risk_level = str(data.get("risk_level", "moderate")).strip().lower()
++            if risk_level not in {"negligible", "low", "moderate", "high", "severe"}:
++                risk_level = "moderate"
++            assessment = RiskAssessment(
++                verdict=verdict,
++                risk_level=risk_level,  # type: ignore[arg-type]
++                reasoning=str(data.get("reasoning", "")).strip(),
++                conditions=str(data.get("conditions", "")).strip(),
++                similar_past_lessons=str(data.get("similar_past_lessons", "")).strip(),
++                elapsed_ms=elapsed,
++                cache_key=key,
++            )
++        except Exception as exc:
++            # Any unexpected failure → fail open with warning.
++            return RiskAssessment(
++                verdict=GuardianVerdict.WARN,
++                risk_level="moderate",
++                reasoning=f"Guardian LLM call failed: {exc!r}. Proceeding with warning.",
++                conditions="",
++                similar_past_lessons="",
++            )
++
++        # Cache write with LRU eviction.
++        with self._lock:
++            self._cache[key] = (time.time(), assessment)
++            while len(self._cache) > self._cache_size:
++                # Evict oldest by timestamp.
++                oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
++                self._cache.pop(oldest_key, None)
++
++        return assessment
++
++    @staticmethod
++    def _parse_json(raw: str) -> dict[str, Any] | None:
++        if not raw:
++            return None
++        text = raw.strip()
++        if text.startswith("```"):
++            lines = text.splitlines()
++            if lines and lines[0].startswith("```"):
++                lines = lines[1:]
++            if lines and lines[-1].startswith("```"):
++                lines = lines[:-1]
++            text = "\n".join(lines).strip()
++        try:
++            return json.loads(text)
++        except Exception:
++            pass
++        start = text.find("{")
++        end = text.rfind("}")
++        if start >= 0 and end > start:
++            try:
++                return json.loads(text[start : end + 1])
++            except Exception:
++                return None
++        return None
++
++
++# --------------------------------------------------------------------------- #
++# Module-level singleton
++# --------------------------------------------------------------------------- #
++
++_guardian: SmartGuardian | None = None
++
++
++def get_guardian() -> SmartGuardian:
++    global _guardian
++    if _guardian is None:
++        _guardian = SmartGuardian()
++    return _guardian
++
++
++def configure_guardian(
++    *,
++    llm_call=None,
++    reflexion_recall=None,
++    cache_size: int = 512,
++    cache_ttl_seconds: int = 3600,
++) -> SmartGuardian:
++    global _guardian
++    _guardian = SmartGuardian(
++        llm_call=llm_call,
++        reflexion_recall=reflexion_recall,
++        cache_size=cache_size,
++        cache_ttl=cache_ttl_seconds,
++    )
++    return _guardian
+diff --git a/docs/REASONING_DESIGN.md b/docs/REASONING_DESIGN.md
+new file mode 100644
+index 0000000..e7396cb
+--- /dev/null
++++ b/docs/REASONING_DESIGN.md
+@@ -0,0 +1,636 @@
++# Reasoning-First Protocol v1 — Design Document
++
++> **Status:** Implemented (opt-in). Default OFF; preserves legacy behavior.
++> **Author:** Super Z (autonomous development pass, 2026-06-30)
++> **Goal:** Turn Hermes-Omni into a reasoning-first agent where the framework
++> *enables* the LLM's intelligence instead of bottlenecking it, while
++> preventing reckless actions through context-aware safety (not regex).
++
++---
++
++## 1. Problem Statement
++
++The fork `airdropp20208-star/hermes-omni` has two structural problems that
++this design addresses:
++
++### 1.1 Unlimited mode is the wrong kind of safety removal
++
++The "unlimited mode" commits (`be3646d`, `0d1038f`) disabled *all* safety
++guardrails — pattern-based blocking, approval prompts, rate limiting, file
++size caps, context window floors, idle timeouts. The stated goal was "agent
++runs like Codex" but the implementation is "agent has no safety at all":
++
++- `rm -rf /` executes without question
++- `MINIMUM_CONTEXT_LENGTH = 1` accepts models that will immediately OOM
++- Tool loop detection is set to 999,999 — agent can call the same failing
++  tool forever
++- File read cap is 999,999,999 chars — single read can OOM the process
++
++This is **not** what a reasoning-first agent needs. A reasoning-first agent
++needs *smart* safety — safety that understands context and scales with the
++LLM's intelligence. Removing all safety just makes the agent reckless.
++
++### 1.2 Pattern-based guardian cannot reason
++
++The legacy guardian (`agent/unified/policy.py`, `agent/guardian.py`) blocks
++actions using regex patterns. This is the wrong abstraction:
++
++- `rm\s+-rf` matches both `rm -rf node_modules/` (safe) and `rm -rf /` (catastrophic). Regex cannot tell them apart.
++- The rules never improve. Once written, they're static.
++- Creative workflows get over-blocked. A senior engineer doing
++  `git push --force` to their own feature branch knows what they're doing.
++
++### 1.3 Two parallel OmniAgent integration layers
++
++The fork has two overlapping integration layers:
++
++| Layer | Path | Wiring | Storage |
++|---|---|---|---|
++| A (declarative) | `agent/unified/` | `model_tools.handle_function_call` | `~/.hermes/unified/reflexions.jsonl` |
++| B (port-imperative) | `agent/omni_integration.py` | `conversation_loop.run_conversation` | `.hermes/learnings/lessons.jsonl` |
++
++Both implement guardian + reflexion with different APIs. This is tech debt.
++
++---
++
++## 2. Design Goals
++
++1. **Don't bottleneck the LLM.** Plans are generated by the LLM itself,
++   through a single function call. No multi-turn scaffolding, no chained
++   prompts. One call, one plan.
++
++2. **Match plan depth to action consequence.** A `read_file` is TRIVIAL —
++   skip planning entirely. A `git push --force` is IRREVERSIBLE — generate
++   a full plan AND a critique AND require explicit acknowledgement.
++
++3. **Never block — escalate.** The protocol does not refuse actions. It
++   returns structured reasoning that the conversation loop can choose to
++   present to the user, log, or proceed. The LLM is the judge, not the
++   framework.
++
++4. **Fail open, not closed.** If the LLM call fails (network, quota, etc.),
++   the protocol degrades to the legacy path: execute the tool. Better to
++   execute one risky action than to brick the agent entirely.
++
++5. **Opt-in, not default.** All new behavior is gated behind config flags.
++   Default behavior is unchanged. Users opt into reasoning-first mode
++   explicitly.
++
++6. **Build on the cleaner integration layer.** All new code lives under
++   `agent/unified/`. The legacy `agent/omni_integration.py` is marked
++   deprecated but not removed (to avoid breaking `conversation_loop.py`).
++
++---
++
++## 3. Architecture
++
++```
++                    ┌──────────────────────────────────────┐
++                    │   model_tools.handle_function_call   │
++                    └─────────────────┬────────────────────┘
++                                      │
++                                      ▼
++                    ┌──────────────────────────────────────┐
++                    │  agent.unified.integration           │
++                    │  .before_tool_call()                 │
++                    └─────────────────┬────────────────────┘
++                                      │
++              ┌───────────────────────┼───────────────────────┐
++              ▼                       ▼                       ▼
++   ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
++   │ Step 1: Pattern  │   │ Step 2:          │   │ Step 3: Reason   │
++   │ PolicyEngine     │   │ DecisionFrame    │   │ Protocol.plan()  │
++   │ (legacy, fast)   │   │ .classify()      │   │ (if enabled)     │
++   │                  │   │                  │   │                  │
++   │ Blocks: rm -rf / │   │ TRIVIAL → skip   │   │ Generates JSON   │
++   │ fork bomb, mkfs  │   │ STANDARD → brief │   │ plan via LLM     │
++   │ (zero LLM cost)  │   │ CONSEQUENTIAL    │   │                  │
++   │                  │   │ IRREVERSIBLE     │   │                  │
++   └──────────────────┘   └────────┬─────────┘   └────────┬─────────┘
++                                   │                      │
++                                   ▼                      ▼
++                          ┌──────────────────┐   ┌──────────────────┐
++                          │ Step 4: Smart    │   │ Step 5: Hard     │
++                          │ Guardian         │   │ floor for        │
++                          │ .assess()        │   │ IRREVERSIBLE     │
++                          │ (if enabled)     │   │                  │
++                          │                  │   │ Returns message  │
++                          │ LLM judge with   │   │ telling LLM to   │
++                          │ cache + TTL      │   │ call             │
++                          │                  │   │ reasoning_decide │
++                          │ ALLOW / WARN /   │   │ or pick safer    │
++                          │ REQUIRE_USER /   │   │ alternative      │
++                          │ BLOCK            │   │                  │
++                          └──────────────────┘   └──────────────────┘
++```
++
++After the tool executes:
++
++```
++                    ┌──────────────────────────────────────┐
++                    │  agent.unified.integration           │
++                    │  .after_tool_call()                  │
++                    └─────────────────┬────────────────────┘
++                                      │
++              ┌───────────────────────┼───────────────────────┐
++              ▼                       ▼                       ▼
++   ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
++   │ Emit tool.finish │   │ Legacy reflexion │   │ New: reasoning   │
++   │ event            │   │ (failure →       │   │ reflection       │
++   │                  │   │  lesson)         │   │ (if plan made)   │
++   │                  │   │                  │   │                  │
++   │                  │   │ Persists to      │   │ Persists to      │
++   │                  │   │ reflexions.jsonl │   │ reflexions.jsonl │
++   └──────────────────┘   └──────────────────┘   └──────────────────┘
++```
++
++---
++
++## 4. Decision Classification
++
++The `DecisionFramework` (`agent/unified/decision.py`) classifies every tool
++call into one of four classes. Classification is pure-Python heuristics
++(regex + tool-name matching), runs in microseconds, and never blocks.
++
++| Class | Examples | Behavior |
++|---|---|---|
++| **TRIVIAL** | `read_file`, `ls`, `grep`, `glob`, `unified_recall` | Execute immediately, no plan |
++| **STANDARD** | `bash ls`, unknown tools, default fallback | Brief plan (goal + approach), execute |
++| **CONSEQUENTIAL** | `git push`, `sudo`, `pip install`, `INSERT INTO`, `curl \| sh` | Full plan + critique, execute if sound |
++| **IRREVERSIBLE** | `rm -rf /`, `mkfs`, `dd if=...of=/dev/`, `git push --force`, `DROP TABLE`, `shutdown` | Full plan + critique + explicit acknowledgement (hard floor by default) |
++
++Classification rules:
++
++1. **Argument values override tool names.** `bash` with `command="ls"` is
++   STANDARD; `bash` with `command="rm -rf /"` is IRREVERSIBLE. The risk is
++   in the value, not the tool.
++2. **Read-only tools default to TRIVIAL.** No plan needed for inspection.
++3. **Send/publish/deploy tools default to CONSEQUENTIAL.** External side
++   effects are non-trivial.
++4. **Execute/bash/run tools default to STANDARD.** Unless args escalate.
++5. **Unknown tools default to STANDARD.** Conservative — better to plan
++   once too many than once too few.
++
++---
++
++## 5. Reasoning Protocol
++
++The `ReasoningProtocol` (`agent/unified/reasoning.py`) is a 4-phase loop:
++**plan → critique → execute → reflect**.
++
++### 5.1 Plan
++
++Generated by a single LLM call. Returns STRICT JSON:
++
++```json
++{
++  "goal": "what this action is supposed to achieve",
++  "approach": "how this tool call achieves the goal",
++  "alternatives": "other viable approaches, or empty string if none",
++  "risks": "what could go wrong, or empty string if nothing notable",
++  "reversibility": "can this be undone? how?",
++  "decision": "proceed" | "abort" | "ask_user",
++  "rationale": "one-sentence justification for the decision"
++}
++```
++
++If `decision` is `abort`, the protocol blocks the action with the rationale.
++If `decision` is `ask_user`, the protocol surfaces the rationale to the LLM
++(which can choose to surface it to the user).
++
++### 5.2 Critique
++
++Only generated for CONSEQUENTIAL+ actions. Same LLM, different prompt:
++
++```json
++{
++  "blind_spots": "what the plan missed",
++  "assumptions_verified": "assumptions the plan made that are correct",
++  "assumptions_invalid": "assumptions the plan made that are wrong, or empty",
++  "recommendation": "proceed" | "modify" | "abort",
++  "modified_approach": "if recommendation=modify, describe the change"
++}
++```
++
++The critique is currently advisory — it's emitted as an event and the LLM
++sees it in the conversation. A future version may auto-block on
++`recommendation=abort`.
++
++### 5.3 Execute
++
++The actual tool call. This is handled by Hermes' existing tool dispatcher;
++the protocol doesn't touch it.
++
++### 5.4 Reflect
++
++After execution, the protocol generates a reflection:
++
++```json
++{
++  "outcome_matched": true | false,
++  "expected": "what the plan expected",
++  "actual": "what actually happened (brief)",
++  "lesson": "the transferable lesson, or empty if nothing notable",
++  "score": 0.0 to 5.0
++}
++```
++
++If `lesson` is non-empty, it's persisted into the `ReflexionStore` as a
++record with `source="reasoning_reflection"` and `tags=["reflection",
++"reasoning"]`. Future similar situations can recall it.
++
++### 5.5 Fail-open semantics
++
++Every LLM call is wrapped in `try/except`. If the LLM is unavailable,
++returns garbage, or raises:
++
++- `plan()` returns `None` → action proceeds without plan
++- `critique()` returns `None` → action proceeds without critique
++- `reflect()` returns `None` → no reflection persisted
++- `SmartGuardian.assess()` returns `WARN` → action proceeds with warning
++
++The agent never gets bricked by an LLM outage.
++
++---
++
++## 6. Smart Guardian
++
++The `SmartGuardian` (`agent/unified/smart_guardian.py`) is the
++LLM-as-judge replacement for the pattern-based guardian.
++
++### 6.1 Pipeline
++
++1. Pattern-based `PolicyEngine` runs FIRST (legacy). Blocks catastrophic
++   patterns (`rm -rf /`, fork bomb, `mkfs`) with zero LLM cost.
++2. `DecisionFramework` classifies the action.
++3. If TRIVIAL or STANDARD → return `ALLOW` immediately (skip judge).
++4. If CONSEQUENTIAL or IRREVERSIBLE → call LLM judge (with caching).
++5. If LLM unavailable → return `WARN` (fail open).
++
++### 6.2 Verdicts
++
++| Verdict | Behavior |
++|---|---|
++| `ALLOW` | Proceed, no warning |
++| `WARN` | Proceed, but log/notify |
++| `REQUIRE_USER_CONFIRM` | Pause and ask the user |
++| `BLOCK` | Refuse; this is final |
++
++### 6.3 Caching
++
++Verdicts are cached by a content-hash of (tool_name, args,
++classification_reason, plan_decision). Cache has:
++
++- **Bounded size** (default 512 entries, LRU eviction)
++- **TTL** (default 1 hour, so stale verdicts don't permanently allow
++  risky patterns)
++
++The cache key intentionally excludes the plan *text* (which varies with
++LLM temperature) — only the plan's *decision* field is included. Two
++plans with the same decision but different prose share a cache entry.
++
++### 6.4 Hard floor for IRREVERSIBLE
++
++By default (`hard_block_irreversible: true`), IRREVERSIBLE actions are
++blocked at the framework layer even if the LLM judge says `ALLOW`. The
++block message tells the LLM to either:
++
++1. Call the `reasoning_decide` tool with `acknowledged_irreversible=true`
++   and a rationale, OR
++2. Choose a safer alternative.
++
++This is the **bridge between "unlimited mode" (no safety) and "pattern-block
++mode" (regex can't reason)**. The agent has the *appearance* of unlimited
++autonomy (it can do anything with explicit acknowledgement) while
++maintaining a context-aware safety net that scales with the LLM's
++intelligence.
++
++Set `unified.smart_guardian.hard_block_irreversible: false` to disable
++the hard floor entirely (true Codex-style autonomy — trust the LLM judge
++completely).
++
++---
++
++## 7. Explicit Reasoning Tools
++
++Four new tools in `tools/reasoning_tools.py` let the agent *explicitly*
++express its reasoning to the framework, even when the implicit protocol
++is disabled:
++
++| Tool | Purpose |
++|---|---|
++| `reasoning_plan` | Record an explicit plan before a consequential action |
++| `reasoning_critique` | Record a self-critique of a plan |
++| `reasoning_decide` | Make an explicit, auditable decision (with optional `acknowledged_irreversible=true`) |
++| `reasoning_reflect` | Record a post-action reflection (lesson persisted to reflexion store) |
++
++These tools exist because:
++
++1. **Transparency.** Users can see *why* the agent chose to act.
++2. **Override hook.** The agent can call `reasoning_decide` with
++   `decision=ask_user` when genuinely unsure.
++3. **Persistent record.** Plans/decisions are logged in conversation
++   history and can be replayed/audited.
++4. **Works with any LLM.** Models that don't natively emit structured
++   reasoning can be prompted to call these tools explicitly.
++
++The `reasoning_decide` tool is the **escape hatch** for the hard floor.
++When the framework blocks an IRREVERSIBLE action, the LLM can call
++`reasoning_decide` with `acknowledged_irreversible=true` to proceed. This
++makes the agent's reasoning auditable — every irreversible action has a
++recorded rationale.
++
++---
++
++## 8. Configuration
++
++All new behavior is opt-in via `config.yaml`:
++
++```yaml
++unified:
++  enabled: true                    # master switch (existing)
++  reflexion:
++    enabled: true                  # existing
++  guardian:
++    enabled: true                  # existing (pattern-based)
++    block_tools: []                # existing
++
++  # --- New: Reasoning-first protocol v1 ---
++  reasoning:
++    enabled: false                 # default OFF
++    persist_reflections: true      # persist lessons into reflexion store
++
++  smart_guardian:
++    enabled: false                 # default OFF
++    hard_block_irreversible: true  # hard floor for IRREVERSIBLE
++    cache_size: 512
++    cache_ttl_seconds: 3600
++```
++
++Environment variable overrides:
++
++```bash
++export HERMES_UNIFIED_REASONING=1
++export HERMES_UNIFIED_SMART_GUARDIAN=1
++```
++
++### 8.1 Wiring the LLM
++
++The reasoning protocol and smart guardian need an LLM client to generate
++plans/verdicts. Hermes' setup path must call this once the LLM client is
++available:
++
++```python
++from agent.unified.integration import configure_reasoning_stack
++
++def llm_call(system_prompt: str, user_prompt: str) -> str:
++    return my_llm_client.chat(system=system_prompt, user=user_prompt)
++
++configure_reasoning_stack(
++    llm_call=llm_call,
++    conversation_context_provider=lambda: get_recent_context_summary(),
++)
++```
++
++Until this is called, the protocol degrades to no-LLM mode (skips plans,
++returns WARN for consequential actions).
++
++### 8.2 Recommended presets
++
++**Conservative (default):**
++```yaml
++unified:
++  reasoning:
++    enabled: false
++  smart_guardian:
++    enabled: false
++```
++Behavior identical to legacy Hermes. No LLM cost overhead.
++
++**Reasoning-first (recommended for production):**
++```yaml
++unified:
++  reasoning:
++    enabled: true
++    persist_reflections: true
++  smart_guardian:
++    enabled: true
++    hard_block_irreversible: true
++```
++Agent reasons before every consequential action, LLM judge evaluates risk,
++hard floor prevents irreversible actions without explicit acknowledgement.
++
++**Full autonomy (Codex-style, NOT recommended):**
++```yaml
++unified:
++  reasoning:
++    enabled: true
++  smart_guardian:
++    enabled: true
++    hard_block_irreversible: false  # trust the LLM judge entirely
++```
++Agent reasons and the LLM judge is the only safety net. Closest to
++"unlimited mode" but with structured reasoning — the LLM must justify
++every consequential action, and the justification is auditable.
++
++---
++
++## 9. File Inventory
++
++### New files
++
++| File | Lines | Purpose |
++|---|---|---|
++| `agent/unified/decision.py` | ~210 | DecisionFramework — classifies actions by consequence |
++| `agent/unified/reasoning.py` | ~340 | ReasoningProtocol — plan/critique/reflect |
++| `agent/unified/smart_guardian.py` | ~310 | SmartGuardian — LLM-as-judge with cache |
++| `tools/reasoning_tools.py` | ~280 | 4 explicit reasoning tools |
++| `docs/REASONING_DESIGN.md` | this file | Design document |
++
++### Modified files
++
++| File | Changes |
++|---|---|
++| `agent/unified/config.py` | Added 6 new config fields with env var overrides |
++| `agent/unified/integration.py` | Wired reasoning + smart guardian into `before_tool_call`/`after_tool_call`; added `configure_reasoning_stack()`; added `_prune_pending()`; updated `framework_status()` |
++| `agent/omni_integration.py` | Added deprecation notice pointing to `agent/unified/` |
++
++### Untouched (intentionally)
++
++- `agent/conversation_loop.py` — still imports `OmniFeatureGate` from
++  `agent/omni_integration.py`. Migration to unified layer is a separate PR.
++- `agent/guardian.py` — dead code from unlimited mode. Cleanup is a
++  separate PR.
++- `tools/approval.py` — `_YOLO_MODE_FROZEN = True` from unlimited mode.
++  Cleanup is a separate PR.
++- `cli.py`, `run_agent.py`, `hermes_state.py` — mega-files, not touched.
++
++---
++
++## 10. Testing
++
++Smoke tests run during development:
++
++- **DecisionFramework**: `read_file` → TRIVIAL, `bash ls` → STANDARD,
++  `git push` → CONSEQUENTIAL, `rm -rf /` → IRREVERSIBLE, `DROP TABLE` →
++  IRREVERSIBLE, `git push --force` → IRREVERSIBLE. ✅
++- **ReasoningProtocol (no LLM)**: trivial → no plan, standard without LLM
++  → no plan, reflect without plan → None. ✅
++- **SmartGuardian (no LLM)**: trivial → ALLOW, standard → ALLOW,
++  consequential without LLM → WARN, irreversible without LLM → WARN. ✅
++- **SmartGuardian (mock LLM)**: plan generates, verdict returns, cache
++  hits on second call. ✅
++
++Formal tests should be added to `tests/unified/`:
++
++- `test_decision.py` — classification edge cases
++- `test_reasoning.py` — plan/critique/reflect with mock LLM
++- `test_smart_guardian.py` — verdict caching, TTL expiry, fail-open
++- `test_integration_reasoning.py` — end-to-end before/after_tool_call
++
++---
++
++## 11. Limitations & Future Work
++
++### 11.1 Not yet wired into the conversation loop
++
++The reasoning protocol is wired into `model_tools.handle_function_call()`
++via `agent.unified.integration.before_tool_call()`/`after_tool_call()`.
++But the LLM client is not yet wired in — `configure_reasoning_stack()`
++needs to be called from Hermes' setup path. This is a one-line change in
++`hermes_cli/setup.py` or `agent/conversation_loop.py` but requires
++knowing where the LLM client is initialized.
++
++### 11.2 Critique is advisory, not enforcing
++
++The critique phase currently emits an event but does not auto-block on
++`recommendation=abort`. This is intentional for v1 (don't over-block
++during rollout) but should be tightened in v2.
++
++### 11.3 No streaming for plan generation
++
++The plan LLM call is synchronous. For top-tier models with slow planning
++(e.g., Claude Opus with extended thinking), this could add 5-15 seconds
++to consequential actions. Streaming would improve UX.
++
++### 11.4 No multi-model routing
++
++The protocol uses whatever LLM is configured. A future version could
++route plan generation to a fast model (Haiku/MiniMax) and risk
++assessment to a strong model (Opus/GPT-5), optimizing cost.
++
++### 11.5 No reflexion on success
++
++Currently, reflections are only persisted if `lesson` is non-empty. The
++LLM is instructed to return empty lesson for unremarkable successes.
++This means we don't learn from successes — only from mismatches. A
++future version could persist "what worked" lessons too.
++
++### 11.6 Conversation context provider not implemented
++
++The `conversation_context_provider` parameter exists but is not
++implemented in this PR. The protocol falls back to empty context. A
++future version should summarize the last N turns and feed it to the
++planning prompt.
++
++### 11.7 Legacy OmniFeatureGate not migrated
++
++`agent/omni_integration.py` is marked deprecated but still imported by
++`conversation_loop.py`. Migration requires touching the mega-file
++`conversation_loop.py` (4,843 lines) — risky. Defer to a separate PR.
++
++---
++
++## 12. Why This Approach (vs. Alternatives)
++
++### vs. "Just use unlimited mode"
++
++Unlimited mode removes all safety. This works for trusted environments
++but is reckless for production. The reasoning-first protocol provides
++*smarter* safety — safety that scales with the LLM's intelligence.
++
++### vs. "Just use pattern-based guardian"
++
++Pattern-based guardian cannot reason. It blocks `rm -rf` regardless of
++target, which over-blocks legitimate work. The Smart Guardian uses the
++LLM to evaluate context, so `rm -rf node_modules/` is allowed while
++`rm -rf /` is blocked.
++
++### vs. "Just rely on the LLM's internal chain-of-thought"
++
++Top-tier LLMs reason well internally, but:
++
++- Not all models do. The framework should support any model.
++- Internal CoT is invisible — can't be persisted, recalled, or audited.
++- The protocol gives a *structured* reasoning artifact for downstream use.
++
++The protocol is NOT a replacement for the LLM's own reasoning — it's a
++structured surface that *captures* that reasoning.
++
++### vs. "Multi-agent debate"
++
++Multi-agent debate (e.g., 3 agents arguing) is expensive and slow. The
++reasoning protocol uses a single LLM call per phase, which is 3-10x
++cheaper than debate. For most consequential actions, single-call
++reasoning is sufficient.
++
++### vs. " Constitutional AI / RLHF"
++
++Constitutional AI and RLHF are training-time interventions. The
++reasoning-first protocol is inference-time — it works with any model
++without retraining. It's complementary, not competing.
++
++---
++
++## 13. Migration Path
++
++For users currently on unlimited mode who want to switch to
++reasoning-first:
++
++1. **Enable reasoning** (zero risk — protocol degrades to no-op if LLM
++   not wired):
++   ```yaml
++   unified:
++     reasoning:
++       enabled: true
++   ```
++
++2. **Wire the LLM** (one-line change in setup path):
++   ```python
++   configure_reasoning_stack(llm_call=my_llm_client.chat)
++   ```
++
++3. **Enable Smart Guardian** (adds LLM cost for consequential actions
++   only):
++   ```yaml
++   unified:
++     smart_guardian:
++       enabled: true
++       hard_block_irreversible: true  # keep the hard floor initially
++   ```
++
++4. **Observe for a week.** Check `unified_framework_status` output and
++   the reflexion store to see what's being learned.
++
++5. **Optionally disable hard floor** once you trust the LLM judge:
++   ```yaml
++   unified:
++     smart_guardian:
++       hard_block_irreversible: false
++   ```
++
++---
++
++## 14. Success Criteria
++
++This design is successful if:
++
++1. ✅ A `read_file` call has zero framework overhead (TRIVIAL → skip).
++2. ✅ A `rm -rf /` call is blocked by the pattern layer (zero LLM cost).
++3. ✅ A `git push --force` call generates a plan and critique (auditable).
++4. ✅ A `git push --force` to a feature branch can proceed with explicit
++   acknowledgement (escapes hard floor via `reasoning_decide`).
++5. ✅ Agent learns from failures (reflexion) AND from reasoning
++   mismatches (reflection).
++6. ✅ Agent never gets bricked by LLM outage (fail-open everywhere).
++7. ✅ Default behavior is unchanged (opt-in).
+diff --git a/tools/reasoning_tools.py b/tools/reasoning_tools.py
+new file mode 100644
+index 0000000..28c0034
+--- /dev/null
++++ b/tools/reasoning_tools.py
+@@ -0,0 +1,361 @@
++"""Reasoning tools — explicit reasoning surface for the agent.
++
++These tools let the agent *explicitly* express its reasoning to the
++framework, even when the implicit protocol (ReasoningProtocol.plan())
++is disabled or unavailable. They are also the user-visible surface:
++users can see the agent's plans, critiques, and decisions in the TUI
++or messaging gateway.
++
++Why expose reasoning as tools (instead of only running it implicitly)?
++--------------------------------------------------------------------
++1. **Transparency.** A user reading the conversation can see *why* the
++   agent chose to act. This builds trust.
++2. **Override hook.** The agent can choose to call `reasoning_decide`
++   with `decision=ask_user` when it's genuinely unsure, instead of
++   silently failing or recklessly proceeding.
++3. **Persistent record.** Plans/decisions invoked through tools are
++   logged in the conversation history and can be replayed/audited.
++4. **Works with any LLM.** Models that don't natively emit structured
++   reasoning can be prompted to call these tools explicitly.
++
++The tools are intentionally low-overhead: they just format and persist
++the reasoning artifact. They do NOT call the LLM (the conversation loop
++already does that implicitly via ReasoningProtocol).
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from typing import Any
++
++from agent.unified.integration import current_scope, get_bus
++from tools.registry import registry
++
++
++# --------------------------------------------------------------------------- #
++# Tool handlers
++# --------------------------------------------------------------------------- #
++
++
++def reasoning_plan_tool(args: dict[str, Any], **_: Any) -> str:
++    """Persist an explicit reasoning plan. The agent calls this when it
++    wants to record its thinking before a consequential action."""
++    tool = str(args.get("tool", "")).strip()
++    goal = str(args.get("goal", "")).strip()
++    approach = str(args.get("approach", "")).strip()
++    risks = str(args.get("risks", "")).strip() or "(none noted)"
++    reversibility = str(args.get("reversibility", "")).strip() or "(unknown)"
++    decision = str(args.get("decision", "proceed")).strip().lower()
++    if decision not in {"proceed", "abort", "ask_user"}:
++        decision = "proceed"
++
++    plan = {
++        "tool": tool,
++        "goal": goal,
++        "approach": approach,
++        "risks": risks,
++        "reversibility": reversibility,
++        "decision": decision,
++        "scope": current_scope(),
++        "recorded_at": time.time(),
++    }
++
++    try:
++        get_bus().emit(
++            "reasoning.plan",
++            {"tool": tool, "decision": decision, "goal_preview": goal[:200]},
++        )
++    except Exception:
++        pass
++
++    return json.dumps(
++        {
++            "status": "recorded",
++            "plan": plan,
++            "note": (
++                "Plan recorded. Proceed with the planned tool call."
++                if decision == "proceed"
++                else "Plan recorded. Awaiting user input before proceeding."
++                if decision == "ask_user"
++                else "Plan recorded. Action aborted by agent's own decision."
++            ),
++        },
++        ensure_ascii=False,
++    )
++
++
++def reasoning_critique_tool(args: dict[str, Any], **_: Any) -> str:
++    """Persist a self-critique of a plan. Used by the agent to record
++    that it has identified blind spots before proceeding."""
++    plan_summary = str(args.get("plan_summary", "")).strip()
++    blind_spots = str(args.get("blind_spots", "")).strip() or "(none identified)"
++    recommendation = str(args.get("recommendation", "proceed")).strip().lower()
++    if recommendation not in {"proceed", "modify", "abort"}:
++        recommendation = "proceed"
++    modified_approach = str(args.get("modified_approach", "")).strip()
++
++    critique = {
++        "plan_summary": plan_summary,
++        "blind_spots": blind_spots,
++        "recommendation": recommendation,
++        "modified_approach": modified_approach,
++        "recorded_at": time.time(),
++    }
++
++    try:
++        get_bus().emit(
++            "reasoning.critique",
++            {"recommendation": recommendation, "blind_spots_preview": blind_spots[:200]},
++        )
++    except Exception:
++        pass
++
++    return json.dumps(
++        {"status": "recorded", "critique": critique},
++        ensure_ascii=False,
++    )
++
++
++def reasoning_decide_tool(args: dict[str, Any], **_: Any) -> str:
++    """Make a decision with explicit reasoning. This is the agent's
++    "I have thought about this and I choose to X" surface. It exists
++    so that consequential decisions are always auditable."""
++    action = str(args.get("action", "")).strip()
++    decision = str(args.get("decision", "proceed")).strip().lower()
++    if decision not in {"proceed", "abort", "ask_user"}:
++        decision = "proceed"
++    rationale = str(args.get("rationale", "")).strip()
++    acknowledged_irreversible = bool(args.get("acknowledged_irreversible", False))
++
++    record = {
++        "action": action,
++        "decision": decision,
++        "rationale": rationale,
++        "acknowledged_irreversible": acknowledged_irreversible,
++        "scope": current_scope(),
++        "recorded_at": time.time(),
++    }
++
++    try:
++        get_bus().emit(
++            "reasoning.decide",
++            {
++                "action": action,
++                "decision": decision,
++                "acknowledged_irreversible": acknowledged_irreversible,
++            },
++        )
++    except Exception:
++        pass
++
++    return json.dumps(
++        {
++            "status": "recorded",
++            "decision": record,
++            "note": (
++                "Decision recorded. Proceeding."
++                if decision == "proceed"
++                else "Decision recorded. Action aborted by agent."
++                if decision == "abort"
++                else "Decision recorded. Awaiting user confirmation."
++            ),
++        },
++        ensure_ascii=False,
++    )
++
++
++def reasoning_reflect_tool(args: dict[str, Any], **_: Any) -> str:
++    """Record a post-action reflection. The agent calls this after a
++    consequential action to record whether the outcome matched its
++    expectations and what it learned."""
++    tool = str(args.get("tool", "")).strip()
++    outcome_matched = bool(args.get("outcome_matched", True))
++    expected = str(args.get("expected", "")).strip()
++    actual = str(args.get("actual", "")).strip()
++    lesson = str(args.get("lesson", "")).strip()
++
++    # Persist the lesson into the reflexion store so future similar
++    # situations can recall it. This bridges explicit reasoning tools
++    # and the implicit reflexion layer.
++    if lesson:
++        try:
++            from agent.unified.integration import get_store
++            from agent.unified.reflexion import ReflexionRecord
++
++            record = ReflexionRecord(
++                lesson=lesson,
++                source="explicit_reflection",
++                score=2.5,
++                tags=["reflection", "explicit"],
++                tool_name=tool,
++                scope=current_scope(),
++            )
++            get_store().add(record)
++        except Exception:
++            pass
++
++    reflection = {
++        "tool": tool,
++        "outcome_matched": outcome_matched,
++        "expected": expected,
++        "actual": actual,
++        "lesson": lesson,
++        "recorded_at": time.time(),
++    }
++
++    try:
++        get_bus().emit(
++            "reasoning.reflect",
++            {"tool": tool, "outcome_matched": outcome_matched, "lesson_preview": lesson[:200]},
++        )
++    except Exception:
++        pass
++
++    return json.dumps(
++        {"status": "recorded", "reflection": reflection},
++        ensure_ascii=False,
++    )
++
++
++# --------------------------------------------------------------------------- #
++# Tool schemas and registration
++# --------------------------------------------------------------------------- #
++
++_REASONING_PLAN_SCHEMA = {
++    "name": "reasoning_plan",
++    "description": (
++        "Record an explicit reasoning plan before a consequential action. "
++        "Use this BEFORE calling a tool whose classification is CONSEQUENTIAL "
++        "or IRREVERSIBLE (e.g., rm -rf, git push --force, DROP TABLE, send "
++        "email to many recipients). The plan is persisted for audit and "
++        "future recall. This tool does NOT execute the action — it only "
++        "records your reasoning. After recording, proceed with the actual "
++        "tool call."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "tool": {"type": "string", "description": "Name of the tool you plan to call next."},
++            "goal": {"type": "string", "description": "What this action is supposed to achieve."},
++            "approach": {"type": "string", "description": "How this tool call achieves the goal."},
++            "risks": {"type": "string", "description": "What could go wrong. Be specific."},
++            "reversibility": {"type": "string", "description": "Can this be undone? How?"},
++            "decision": {
++                "type": "string",
++                "enum": ["proceed", "abort", "ask_user"],
++                "description": "Your decision. 'ask_user' if you need human input before proceeding.",
++            },
++        },
++        "required": ["tool", "goal", "approach", "decision"],
++    },
++}
++
++_REASONING_CRITIQUE_SCHEMA = {
++    "name": "reasoning_critique",
++    "description": (
++        "Record a self-critique of your own plan. Use this after "
++        "reasoning_plan for IRREVERSIBLE actions to verify you haven't "
++        "missed anything. Be skeptical of your own assumptions."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "plan_summary": {"type": "string", "description": "Brief summary of the plan being critiqued."},
++            "blind_spots": {"type": "string", "description": "What the plan missed."},
++            "recommendation": {
++                "type": "string",
++                "enum": ["proceed", "modify", "abort"],
++                "description": "Your critique recommendation.",
++            },
++            "modified_approach": {
++                "type": "string",
++                "description": "If recommendation=modify, describe the change. Empty otherwise.",
++            },
++        },
++        "required": ["plan_summary", "blind_spots", "recommendation"],
++    },
++}
++
++_REASONING_DECIDE_SCHEMA = {
++    "name": "reasoning_decide",
++    "description": (
++        "Make an explicit, auditable decision. Use this when you are about "
++        "to do something the user might question — even if you're confident "
++        "it's correct. The decision is recorded permanently so the user "
++        "can review it later. This is your 'I have thought about this and "
++        "I choose to X' surface."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "action": {"type": "string", "description": "A short description of what you're about to do."},
++            "decision": {
++                "type": "string",
++                "enum": ["proceed", "abort", "ask_user"],
++                "description": "Your decision.",
++            },
++            "rationale": {"type": "string", "description": "One or two sentences explaining why."},
++            "acknowledged_irreversible": {
++                "type": "boolean",
++                "description": "Set to true if you acknowledge this action cannot be undone.",
++            },
++        },
++        "required": ["action", "decision", "rationale"],
++    },
++}
++
++_REASONING_REFLECT_SCHEMA = {
++    "name": "reasoning_reflect",
++    "description": (
++        "Record a reflection after a consequential action. Compare the "
++        "expected outcome to what actually happened, and extract a "
++        "transferable lesson. The lesson is stored in the reflexion "
++        "memory and will be recalled in similar future situations."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "tool": {"type": "string", "description": "Name of the tool that was just executed."},
++            "outcome_matched": {"type": "boolean", "description": "Did the actual outcome match your expectation?"},
++            "expected": {"type": "string", "description": "What you expected to happen."},
++            "actual": {"type": "string", "description": "What actually happened."},
++            "lesson": {"type": "string", "description": "The transferable lesson, or empty if nothing notable."},
++        },
++        "required": ["tool", "outcome_matched", "expected", "actual"],
++    },
++}
++
++
++registry.register(
++    name="reasoning_plan",
++    toolset="unified",
++    schema=_REASONING_PLAN_SCHEMA,
++    handler=reasoning_plan_tool,
++    description="Record an explicit reasoning plan",
++    emoji="🧭",
++)
++registry.register(
++    name="reasoning_critique",
++    toolset="unified",
++    schema=_REASONING_CRITIQUE_SCHEMA,
++    handler=reasoning_critique_tool,
++    description="Record a self-critique of a plan",
++    emoji="🔍",
++)
++registry.register(
++    name="reasoning_decide",
++    toolset="unified",
++    schema=_REASONING_DECIDE_SCHEMA,
++    handler=reasoning_decide_tool,
++    description="Make an explicit, auditable decision",
++    emoji="⚖️",
++)
++registry.register(
++    name="reasoning_reflect",
++    toolset="unified",
++    schema=_REASONING_REFLECT_SCHEMA,
++    handler=reasoning_reflect_tool,
++    description="Record a post-action reflection",
++    emoji="🪞",
++)
+-- 
+2.47.3
+

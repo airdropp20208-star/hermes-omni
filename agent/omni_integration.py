@@ -1,10 +1,32 @@
 """OmniAgent Feature Integration — hooks into hermes-omni's conversation loop.
 
-This module provides a thin integration layer that connects:
-- Deep Reflexion → tool loop detection, error repeat, no-progress
-- Guardian Agent → pre-execution risk review
-- Sentinel Agent → task decomposition, progress tracking
-- Context Evolution → auto-learn from failures
+.. deprecated:: v0.18.0
+    This module is the **legacy** integration layer from the original
+    OmniAgent port (commit 99097a0, 28 Jun 2026). It is being replaced
+    by the cleaner declarative layer at ``agent/unified/`` which wires
+    directly into ``model_tools.handle_function_call()``.
+
+    The two layers have overlapping functionality (guardian, reflexion,
+    sentinel) but different APIs and different storage paths:
+        - ``agent/unified/`` → ``~/.hermes/unified/reflexions.jsonl``
+        - ``agent/omni_integration.py`` → ``.hermes/learnings/lessons.jsonl``
+
+    **For new code, use ``agent/unified/`` instead.** Specifically:
+        - Guardian → ``agent.unified.smart_guardian.SmartGuardian``
+        - Reflexion → ``agent.unified.reflexion.ReflexionStore``
+        - Reasoning → ``agent.unified.reasoning.ReasoningProtocol``
+        - Decision → ``agent.unified.decision.DecisionFramework``
+
+    This file is kept for now so that ``conversation_loop.py`` (which
+    imports ``OmniFeatureGate``) continues to work. It will be removed
+    once the conversation loop is migrated to the unified layer.
+
+Original description (kept for historical context):
+    This module provides a thin integration layer that connects:
+    - Deep Reflexion → tool loop detection, error repeat, no-progress
+    - Guardian Agent → pre-execution risk review
+    - Sentinel Agent → task decomposition, progress tracking
+    - Context Evolution → auto-learn from failures
 
 Usage in conversation_loop.py or tool_executor.py:
     from agent.omni_integration import OmniFeatureGate
