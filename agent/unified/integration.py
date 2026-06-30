@@ -37,6 +37,27 @@ from .smart_guardian import (
     get_guardian,
 )
 from .tool_router import ToolRouter, get_router, refresh_router
+# v2 cognitive extensions
+from .cognitive_tree import CognitiveTree, configure_tree, get_tree
+from .hypothesis import HypothesisEngine, configure_hypothesis_engine, get_hypothesis_engine
+from .context_distiller import ContextDistiller, configure_distiller, get_distiller
+from .metacognitive import MetacognitiveMonitor, SelfDoubtSignal, configure_monitor, get_monitor
+from .causal_graph import (
+    CausalGraph,
+    clear_graph,
+    get_graph as get_causal_graph,
+    get_or_create_graph,
+    list_graphs,
+    set_active_task,
+)
+# v2.1 learning + memory + skill synthesis
+from .learning import LearningEngine, configure_learning_engine, get_learning_engine
+from .skill_synthesizer import (
+    SkillSynthesizer,
+    configure_synthesizer,
+    get_synthesizer,
+    record_tool_call_for_synthesis,
+)
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None
@@ -172,44 +193,91 @@ def before_tool_call(
     # ----- Step 3: Reasoning Protocol (plan + critique) -----
     plan: ReasoningPlan | None = None
     if cfg.reasoning_enabled and classification.requires_plan:
-        try:
-            plan = get_protocol().plan(
-                tool_name=tool_name,
-                args=args,
-                classification=classification,
-            )
-            if plan is not None and tool_call_id:
-                _pending_plans[tool_call_id] = plan
-                _prune_pending()
-            # Emit the plan so TUI/gateway can display it.
-            if plan is not None:
-                _bus.emit(
-                    "reasoning.plan",
-                    {
-                        "tool_name": tool_name,
-                        "decision": plan.decision,
-                        "goal_preview": plan.goal[:200],
-                        "tool_call_id": tool_call_id,
-                    },
-                    session_id=session_id or "",
-                    turn_id=turn_id or "",
+        # v2: CognitiveTree for CONSEQUENTIAL+ actions (if enabled).
+        # Generates N branches, prunes, picks best. Replaces single-plan path.
+        if cfg.cognitive_tree_enabled and classification.requires_critique:
+            try:
+                tree = get_tree()
+                if tree is not None:
+                    ctx = ""
+                    try:
+                        from .integration import _conversation_context_provider
+                        ctx = _conversation_context_provider() if _conversation_context_provider else ""
+                    except Exception:
+                        ctx = ""
+                    result_tree = tree.evaluate(
+                        tool_name=tool_name,
+                        args=args,
+                        classification=classification,
+                        conversation_context=ctx,
+                    )
+                    if result_tree is not None:
+                        plan = result_tree.selected_plan
+                        if plan is not None and tool_call_id:
+                            _pending_plans[tool_call_id] = plan
+                            _prune_pending()
+                        _bus.emit(
+                            "cognitive_tree.result",
+                            {
+                                "tool_name": tool_name,
+                                "branches_count": len(result_tree.branches),
+                                "confidence": result_tree.confidence,
+                                "decision": result_tree.decision,
+                                "llm_calls": result_tree.llm_calls,
+                                "tool_call_id": tool_call_id,
+                            },
+                            session_id=session_id or "",
+                            turn_id=turn_id or "",
+                        )
+                        if result_tree.decision == "abort":
+                            return (
+                                f"CognitiveTree aborted: {result_tree.rationale}"
+                            )
+                        if result_tree.decision == "ask_user":
+                            return (
+                                f"CognitiveTree recommends asking user: {result_tree.rationale}"
+                            )
+            except Exception:
+                pass  # fail open, fall through to v1 plan path
+
+        # v1 fallback: single plan (also runs if cognitive_tree disabled or failed).
+        if plan is None:
+            try:
+                plan = get_protocol().plan(
+                    tool_name=tool_name,
+                    args=args,
+                    classification=classification,
                 )
-            # If the plan itself says "abort", respect that.
-            if plan is not None and plan.decision == "abort":
-                return (
-                    f"Reasoning protocol aborted the action: {plan.rationale or 'no rationale given'}. "
-                    f"Plan goal: {plan.goal}"
-                )
-            # If the plan says "ask_user", surface that — the conversation
-            # loop is responsible for actually pausing; we just return a
-            # message that the LLM will see and can choose to surface.
-            if plan is not None and plan.decision == "ask_user":
-                return (
-                    f"Reasoning protocol recommends asking the user before proceeding: "
-                    f"{plan.rationale or plan.goal}"
-                )
-        except Exception:
-            plan = None  # fail open
+                if plan is not None and tool_call_id:
+                    _pending_plans[tool_call_id] = plan
+                    _prune_pending()
+                # Emit the plan so TUI/gateway can display it.
+                if plan is not None:
+                    _bus.emit(
+                        "reasoning.plan",
+                        {
+                            "tool_name": tool_name,
+                            "decision": plan.decision,
+                            "goal_preview": plan.goal[:200],
+                            "tool_call_id": tool_call_id,
+                        },
+                        session_id=session_id or "",
+                        turn_id=turn_id or "",
+                    )
+                # If the plan itself says "abort", respect that.
+                if plan is not None and plan.decision == "abort":
+                    return (
+                        f"Reasoning protocol aborted the action: {plan.rationale or 'no rationale given'}. "
+                        f"Plan goal: {plan.goal}"
+                    )
+                # If the plan says "ask_user", surface that.
+                if plan is not None and plan.decision == "ask_user":
+                    return (
+                        f"Reasoning protocol recommends asking the user before proceeding: "
+                        f"{plan.rationale or plan.goal}"
+                    )
+            except Exception:
+                plan = None  # fail open
 
     # ----- Step 4: Smart Guardian (LLM judge) -----
     if cfg.smart_guardian_enabled and classification.requires_critique:
@@ -400,12 +468,93 @@ def after_tool_call(
     # Tool router usage feedback (async, non-blocking).
     if cfg.tool_router_enabled and cfg.tool_router_learn:
         try:
-            # Use the tool_name + brief args as the "query" for usage
-            # tracking. This is a heuristic; the conversation loop can
-            # also call record_usage explicitly with the user's actual
-            # message for better signal.
             args_str = json.dumps(args or {}, ensure_ascii=False, default=str)[:200]
             get_router().record_usage(tool_name, f"{tool_name} {args_str}")
+        except Exception:
+            pass
+
+    # v2: Metacognitive monitoring — track outcome, trigger self-doubt.
+    if cfg.metacognitive_enabled:
+        try:
+            monitor = get_monitor()
+            if monitor is not None:
+                # Determine stated confidence from the plan (if any).
+                stated = 0.7  # default if no plan/cognitive tree
+                if plan is not None:
+                    # Heuristic: v1 plans have no confidence field, use 0.7.
+                    stated = 0.7
+                # Determine actual outcome from result.
+                result_str = str(result) if result is not None else ""
+                lowered = result_str.lower()
+                is_failure = any(
+                    marker in lowered
+                    for marker in ("error", "blocked", "permission", "traceback", "failed", "exception")
+                )
+                actual: str
+                if is_failure:
+                    actual = "failure"
+                elif result_str and "success" in lowered:
+                    actual = "success"
+                elif result_str:
+                    actual = "success"
+                else:
+                    actual = "partial"
+                signal = monitor.record_outcome(
+                    stated_confidence=stated,
+                    actual_outcome=actual,  # type: ignore[arg-type]
+                    tool_name=tool_name,
+                )
+                if signal is not None:
+                    _bus.emit(
+                        "metacognitive.self_doubt",
+                        {
+                            "trigger": signal.trigger,
+                            "stated_confidence": signal.stated_confidence,
+                            "calibrated_confidence": signal.calibrated_confidence,
+                            "recommendation": signal.recommendation,
+                            "rationale": signal.rationale,
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call_id,
+                        },
+                        session_id=session_id or "",
+                        turn_id=turn_id or "",
+                    )
+        except Exception:
+            pass
+
+    # v2.1: Skill synthesis — record tool call for pattern detection.
+    if cfg.skill_synthesis_enabled:
+        try:
+            result_str = str(result) if result is not None else ""
+            lowered = result_str.lower()
+            is_failure = any(
+                marker in lowered
+                for marker in ("error", "blocked", "permission", "traceback", "failed", "exception")
+            )
+            record_tool_call_for_synthesis(
+                tool_name=tool_name,
+                args=args,
+                success=not is_failure,
+                session_id=session_id or "",
+            )
+            # Trigger a scan periodically (the synthesizer self-throttles).
+            synth = get_synthesizer()
+            if synth is not None:
+                new_skills = synth.maybe_scan()
+                if new_skills:
+                    for s in new_skills:
+                        _bus.emit(
+                            "skill.synthesized",
+                            {
+                                "skill_id": s.skill_id,
+                                "name": s.name,
+                                "description": s.description,
+                                "source_pattern": s.source_pattern,
+                                "file_path": s.file_path,
+                            },
+                            session_id=session_id or "",
+                            turn_id=turn_id or "",
+                        )
         except Exception:
             pass
 
@@ -595,6 +744,59 @@ def configure_reasoning_stack(
 
         engine.set_reflect_batch_fn(get_protocol().reflect_batch)
 
+    # v2: CognitiveTree (branching reasoning).
+    if cfg.cognitive_tree_enabled:
+        configure_tree(
+            llm_call=llm_call,
+            reflexion_recall=recall_context,
+            n_branches=cfg.cognitive_tree_n_branches,
+            min_confidence=cfg.cognitive_tree_min_confidence,
+            max_confidence=cfg.cognitive_tree_max_confidence,
+        )
+
+    # v2: HypothesisEngine (diagnostic reasoning).
+    if cfg.hypothesis_enabled:
+        configure_hypothesis_engine(
+            llm_call=llm_call,
+            n_hypotheses=cfg.hypothesis_n_hypotheses,
+            max_iterations=cfg.hypothesis_max_iterations,
+            confidence_threshold=cfg.hypothesis_confidence_threshold,
+        )
+
+    # v2: ContextDistiller (structured insight extraction).
+    if cfg.context_distiller_enabled:
+        configure_distiller(
+            llm_call=llm_call,
+            distill_every_n_turns=cfg.context_distill_every_n_turns,
+            max_distilled_items=cfg.context_distiller_max_items,
+            merge_threshold=cfg.context_distiller_merge_threshold,
+        )
+
+    # v2: MetacognitiveMonitor (always configured, even if no LLM — pure stats).
+    if cfg.metacognitive_enabled:
+        configure_monitor(
+            llm_call=llm_call,
+            self_doubt_threshold=cfg.metacognitive_self_doubt_threshold,
+            repeated_failure_count=cfg.metacognitive_repeated_failure_count,
+            min_samples_for_calibration=cfg.metacognitive_min_samples,
+        )
+
+    # v2.1: LearningEngine (extract learnings from every interaction).
+    if cfg.learning_enabled:
+        configure_learning_engine(
+            llm_call=llm_call,
+            max_records=cfg.learning_max_records,
+            extract_every_n_turns=cfg.learning_extract_every_n_turns,
+        )
+
+    # v2.1: SkillSynthesizer (auto-create skills from repeated patterns).
+    if cfg.skill_synthesis_enabled:
+        configure_synthesizer(
+            llm_call=llm_call,
+            min_occurrences=cfg.skill_synthesis_min_occurrences,
+            max_skills=cfg.skill_synthesis_max_skills,
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Tool router public API
@@ -676,3 +878,313 @@ def enqueue_longrun_work(
 def shutdown_longrun(*, timeout: float = 5.0) -> None:
     """Shut down the long-run engine. Call on agent exit."""
     shutdown_engine(timeout=timeout)
+
+
+# --------------------------------------------------------------------------- #
+# v2 cognitive extensions — public API
+# --------------------------------------------------------------------------- #
+
+
+def start_hypothesis_session(*, symptom: str, context: str = "") -> str | None:
+    """Start a diagnostic session. Returns session_id, or None if disabled."""
+    cfg = load_unified_config()
+    if not cfg.hypothesis_enabled:
+        return None
+    engine = get_hypothesis_engine()
+    if engine is None:
+        return None
+    return engine.start_session(symptom=symptom, context=context)
+
+
+def record_hypothesis_test(
+    *,
+    session_id: str,
+    hypothesis_id: str,
+    test_result: str,
+) -> dict[str, Any] | None:
+    """Record the result of testing a hypothesis."""
+    cfg = load_unified_config()
+    if not cfg.hypothesis_enabled:
+        return None
+    engine = get_hypothesis_engine()
+    if engine is None:
+        return None
+    return engine.record_test_result(
+        session_id=session_id,
+        hypothesis_id=hypothesis_id,
+        test_result=test_result,
+    )
+
+
+def get_distilled_context_block() -> str:
+    """Return the current distilled context as a prompt block. Empty if disabled."""
+    cfg = load_unified_config()
+    if not cfg.context_distiller_enabled:
+        return ""
+    distiller = get_distiller()
+    if distiller is None:
+        return ""
+    return distiller.get_prompt_block()
+
+
+def maybe_distill_context(
+    *,
+    turn_count: int,
+    conversation_segment: str,
+    turn_start: int,
+    turn_end: int,
+) -> str | None:
+    """Trigger distillation if enough turns have passed. Returns the
+    new distilled block (or None if not triggered)."""
+    cfg = load_unified_config()
+    if not cfg.context_distiller_enabled:
+        return None
+    distiller = get_distiller()
+    if distiller is None:
+        return None
+    result = distiller.maybe_distill(
+        turn_count=turn_count,
+        conversation_segment=conversation_segment,
+        turn_start=turn_start,
+        turn_end=turn_end,
+    )
+    if result is None:
+        return None
+    return distiller.get_prompt_block()
+
+
+def metacognitive_stats() -> dict[str, Any]:
+    """Return calibration stats, or {"enabled": false} if disabled."""
+    cfg = load_unified_config()
+    if not cfg.metacognitive_enabled:
+        return {"enabled": False}
+    monitor = get_monitor()
+    if monitor is None:
+        return {"enabled": True, "configured": False}
+    return {"enabled": True, "configured": True, **monitor.stats()}
+
+
+# --- Causal graph public API ---
+
+
+def causal_graph_add_node(
+    *,
+    node_id: str,
+    label: str,
+    node_type: str = "action",
+    status: str = "pending",
+    evidence: str = "",
+    task_id: str | None = None,
+) -> bool:
+    """Add a node to the causal graph for the active task."""
+    cfg = load_unified_config()
+    if not cfg.causal_graph_enabled:
+        return False
+    _, graph = get_or_create_graph(task_id)
+    graph.add_node(
+        node_id=node_id,
+        label=label,
+        node_type=node_type,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        evidence=evidence,
+    )
+    return True
+
+
+def causal_graph_add_edge(
+    *,
+    src: str,
+    dst: str,
+    edge_type: str = "causes",
+    strength: float = 1.0,
+    rationale: str = "",
+    task_id: str | None = None,
+) -> bool:
+    """Add a causal edge between two nodes."""
+    cfg = load_unified_config()
+    if not cfg.causal_graph_enabled:
+        return False
+    _, graph = get_or_create_graph(task_id)
+    return graph.add_edge(
+        src=src,
+        dst=dst,
+        edge_type=edge_type,  # type: ignore[arg-type]
+        strength=strength,
+        rationale=rationale,
+    )
+
+
+def causal_graph_root_causes(failure_node_id: str, task_id: str | None = None) -> list[dict[str, Any]]:
+    """Find root causes of a failure node."""
+    cfg = load_unified_config()
+    if not cfg.causal_graph_enabled:
+        return []
+    graph = get_causal_graph(task_id)
+    if graph is None:
+        return []
+    return [
+        {
+            "node_id": n.node_id,
+            "label": n.label,
+            "node_type": n.node_type,
+            "status": n.status,
+            "evidence": n.evidence,
+        }
+        for n in graph.root_causes(failure_node_id)
+    ]
+
+
+def causal_graph_to_mermaid(task_id: str | None = None) -> str:
+    """Render the causal graph as a Mermaid diagram."""
+    cfg = load_unified_config()
+    if not cfg.causal_graph_enabled:
+        return ""
+    graph = get_causal_graph(task_id)
+    if graph is None:
+        return ""
+    return graph.to_mermaid()
+
+
+def causal_graph_stats(task_id: str | None = None) -> dict[str, Any] | None:
+    """Return stats for the causal graph."""
+    cfg = load_unified_config()
+    if not cfg.causal_graph_enabled:
+        return None
+    graph = get_causal_graph(task_id)
+    if graph is None:
+        return None
+    return graph.stats()
+
+
+# --- Conversation context provider hook ---
+
+
+_conversation_context_provider = None
+
+
+def set_conversation_context_provider(provider) -> None:
+    """Set a callable that returns recent conversation context (string).
+    Used by CognitiveTree for planning prompts."""
+    global _conversation_context_provider
+    _conversation_context_provider = provider
+
+
+# --------------------------------------------------------------------------- #
+# v2.1 learning + skill synthesis — public API
+# --------------------------------------------------------------------------- #
+
+
+def recall_learnings(query: str, *, limit: int = 5, scope: str | None = None) -> str:
+    """Recall relevant learnings as a prompt block. Empty if disabled."""
+    cfg = load_unified_config()
+    if not cfg.learning_enabled:
+        return ""
+    engine = get_learning_engine()
+    if engine is None:
+        return ""
+    return engine.format_context(query, limit=limit, scope=scope)
+
+
+def record_learning(
+    *,
+    event_type: str,
+    content: str,
+    importance: float = 2.0,
+    context: str = "",
+    associated_tools: list[str] | None = None,
+    associated_queries: list[str] | None = None,
+    scope: str | None = None,
+) -> bool:
+    """Manually record a learning event."""
+    cfg = load_unified_config()
+    if not cfg.learning_enabled:
+        return False
+    engine = get_learning_engine()
+    if engine is None:
+        return False
+    event = engine.record_manual(
+        event_type=event_type,
+        content=content,
+        importance=importance,
+        context=context,
+        associated_tools=associated_tools,
+        associated_queries=associated_queries,
+        scope=scope or current_scope(),
+    )
+    return event is not None
+
+
+def maybe_extract_learnings(
+    *,
+    turn_count: int,
+    conversation_segment: str,
+    scope: str | None = None,
+) -> int:
+    """Trigger learning extraction if enough turns have passed.
+    Returns the number of new learnings extracted."""
+    cfg = load_unified_config()
+    if not cfg.learning_enabled:
+        return 0
+    engine = get_learning_engine()
+    if engine is None:
+        return 0
+    events = engine.maybe_extract(
+        turn_count=turn_count,
+        conversation_segment=conversation_segment,
+        scope=scope or current_scope(),
+    )
+    return len(events)
+
+
+def learning_stats() -> dict[str, Any]:
+    """Return learning store stats."""
+    cfg = load_unified_config()
+    if not cfg.learning_enabled:
+        return {"enabled": False}
+    engine = get_learning_engine()
+    if engine is None:
+        return {"enabled": True, "configured": False}
+    return {"enabled": True, "configured": True, **engine.stats()}
+
+
+def list_synthesized_skills() -> list[dict[str, Any]]:
+    """List auto-synthesized skills."""
+    cfg = load_unified_config()
+    if not cfg.skill_synthesis_enabled:
+        return []
+    synth = get_synthesizer()
+    if synth is None:
+        return []
+    return synth.list_skills()
+
+
+def skill_synthesis_stats() -> dict[str, Any]:
+    """Return skill synthesis stats."""
+    cfg = load_unified_config()
+    if not cfg.skill_synthesis_enabled:
+        return {"enabled": False}
+    synth = get_synthesizer()
+    if synth is None:
+        return {"enabled": True, "configured": False}
+    return {"enabled": True, "configured": True, **synth.stats()}
+
+
+def trigger_skill_scan(*, force: bool = False) -> list[dict[str, Any]]:
+    """Force a skill synthesis scan. Returns newly synthesized skills."""
+    cfg = load_unified_config()
+    if not cfg.skill_synthesis_enabled:
+        return []
+    synth = get_synthesizer()
+    if synth is None:
+        return []
+    new_skills = synth.maybe_scan(force=force)
+    return [
+        {
+            "skill_id": s.skill_id,
+            "name": s.name,
+            "description": s.description,
+            "source_pattern": s.source_pattern,
+            "file_path": s.file_path,
+        }
+        for s in new_skills
+    ]
