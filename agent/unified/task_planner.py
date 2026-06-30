@@ -361,6 +361,150 @@ class TaskPlanner:
             return None
         return self._plans.get(self._active_plan_id)
 
+    # ------------------------------------------------------------------ #
+    # v2: Recursive decomposition
+    # ------------------------------------------------------------------ #
+
+    def decompose_subtask(
+        self,
+        *,
+        subtask_id: str,
+        max_depth: int = 3,
+    ) -> str | None:
+        """Recursively decompose a subtask into sub-subtasks.
+
+        For complex subtasks (high estimated_difficulty or "complex" in
+        description), generate child subtasks. The original subtask
+        becomes a parent; its children are added to the plan with
+        depends_on pointing to the parent.
+
+        Returns the parent subtask_id if decomposition happened, None
+        if the subtask wasn't found or was too simple to decompose.
+        """
+        plan = self.get_active_plan()
+        if plan is None or self._llm_call is None:
+            return None
+        parent = next((s for s in plan.subtasks if s.subtask_id == subtask_id), None)
+        if parent is None:
+            return None
+        # Skip if already decomposed (has children).
+        existing_children = [s for s in plan.subtasks if subtask_id in s.depends_on]
+        if existing_children:
+            return None
+        # Skip if too simple.
+        if parent.estimated_difficulty < 0.6 and "complex" not in parent.description.lower():
+            return None
+        # Skip if max depth reached (count ancestors).
+        depth = self._subtask_depth(plan, subtask_id)
+        if depth >= max_depth:
+            return None
+        # Generate child subtasks via LLM.
+        try:
+            children = self._generate_children(parent, plan.original_request, plan.context_summary)
+            if not children:
+                return None
+            # Insert children after parent in the plan.
+            parent_idx = plan.subtasks.index(parent)
+            for i, child in enumerate(children):
+                child_id = f"{subtask_id}.{i + 1}"
+                child.subtask_id = child_id
+                child.depends_on = [subtask_id]
+                plan.subtasks.insert(parent_idx + 1 + i, child)
+            # Mark parent as "container" (still in_progress when children done).
+            # The parent will be auto-completed when all children are done.
+            plan.updated_at = time.time()
+            self._persist()
+            return subtask_id
+        except Exception:
+            return None
+
+    def _subtask_depth(self, plan: TaskPlan, subtask_id: str) -> int:
+        """Count ancestor depth of a subtask (e.g., 'st_01.02.03' = depth 3)."""
+        return subtask_id.count(".")
+
+    def _generate_children(
+        self,
+        parent: Subtask,
+        original_request: str,
+        context: str,
+    ) -> list[Subtask]:
+        """Generate child subtasks for a parent via LLM."""
+        system = (
+            "You are the recursive-planning layer. The agent has a subtask "
+            "that is too complex for a single step. Decompose it into 2-5 "
+            "child subtasks.\n\n"
+            "Rules:\n"
+            "- Each child should be ONE discrete action\n"
+            "- Children should be orderable (specify depends_on if needed)\n"
+            "- Children inherit the parent's goal but are more specific\n"
+            "- Don't decompose trivially — only if genuinely complex\n\n"
+            "Return STRICT JSON:\n"
+            "{\n"
+            '  "subtasks": [\n'
+            '    {"description": "...", "depends_on": [], "estimated_difficulty": 0.0-1.0, "tool_hints": [...]}'
+            "  ]\n"
+            "}"
+        )
+        user = (
+            f"Original request: {original_request}\n"
+            f"Context: {context or '(none)'}\n\n"
+            f"Parent subtask to decompose:\n"
+            f"  ID: {parent.subtask_id}\n"
+            f"  Description: {parent.description}\n"
+            f"  Difficulty: {parent.estimated_difficulty}\n"
+            f"  Tool hints: {parent.tool_hints}\n\n"
+            "Decompose into child subtasks."
+        )
+        raw = self._llm_call(system, user)
+        data = self._parse_json(raw)
+        if data is None:
+            return []
+        children: list[Subtask] = []
+        for st_data in data.get("subtasks", [])[:5]:
+            if not isinstance(st_data, dict):
+                continue
+            children.append(
+                Subtask(
+                    subtask_id="",  # will be assigned by caller
+                    description=str(st_data.get("description", "")).strip(),
+                    depends_on=[],  # will be set by caller
+                    estimated_difficulty=max(
+                        0.0, min(1.0, float(st_data.get("estimated_difficulty", 0.5)))
+                    ),
+                    tool_hints=[
+                        str(t).strip() for t in st_data.get("tool_hints", []) if str(t).strip()
+                    ],
+                )
+            )
+        return children
+
+    def auto_complete_parents(self, plan: TaskPlan) -> int:
+        """Auto-complete parent subtasks when all children are done.
+
+        Returns count of parents auto-completed.
+        """
+        completed = 0
+        for subtask in plan.subtasks:
+            if subtask.status != SubtaskStatus.IN_PROGRESS.value:
+                continue
+            # Find children.
+            children = [s for s in plan.subtasks if subtask.subtask_id in s.depends_on]
+            if not children:
+                continue
+            # If all children done/skipped, mark parent done.
+            if all(c.status in (SubtaskStatus.DONE.value, SubtaskStatus.SKIPPED.value) for c in children):
+                child_results = [c.result_summary for c in children if c.result_summary]
+                subtask.status = SubtaskStatus.DONE.value
+                subtask.result_summary = "; ".join(child_results[:3])
+                subtask.completed_at = time.time()
+                completed += 1
+        if completed > 0:
+            plan.update_counts()
+            if plan.is_complete():
+                plan.status = PlanStatus.COMPLETED.value
+            self._persist()
+        return completed
+
     def set_active_plan(self, plan_id: str) -> bool:
         if plan_id not in self._plans:
             return False

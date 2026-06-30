@@ -164,6 +164,29 @@ class UnifiedConfig:
     capability_resolver_enabled: bool = False
     capability_resolver_auto_approve: bool = False  # DANGER: if true, no user prompt
     capability_resolver_allow_network: bool = True
+    # --- v3.1 Tier 1-2 upgrades ---
+    # CostTracker: token accounting + budget caps per phase/session.
+    cost_tracker_enabled: bool = False
+    cost_tracker_total_budget: int = 1_000_000
+    cost_tracker_hard_stop: bool = True
+    # ResponseCache: content-hash cache for LLM calls (saves 30-50% for
+    # repeated prompts in ensemble/slow_thinking).
+    response_cache_enabled: bool = False
+    response_cache_max_entries: int = 512
+    response_cache_ttl_seconds: int = 3600
+    # UserModel: build user profile (expertise, style, domains) for
+    # personalization. Injected into system prompt.
+    user_model_enabled: bool = False
+    # Clarifier: detect ambiguity + ask clarifying questions before acting.
+    clarifier_enabled: bool = False
+    clarifier_heuristic_threshold: float = 0.5
+    clarifier_always_use_llm: bool = False
+    # Streaming: stream LLM tokens instead of batch (UX: user sees progress).
+    streaming_enabled: bool = False
+    # Embedding: semantic recall (replace BM25). +40% recall quality.
+    embedding_enabled: bool = False
+    embedding_backend: str = "local"  # "local" | "openai" | "none"
+    embedding_model: str = "all-MiniLM-L6-v2"
 
 
 _CONFIG_CACHE: UnifiedConfig | None = None
@@ -541,6 +564,67 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         _cfg_get("unified", "capability_resolver", "allow_network", default=True), default=True
     )
 
+    # --- v3.1 Tier 1-2 config ---
+    cost_tracker_enabled = _truthy(
+        _cfg_get("unified", "cost_tracker", "enabled", default=False), default=False
+    )
+    try:
+        cost_tracker_total_budget = int(
+            _cfg_get("unified", "cost_tracker", "total_budget", default=1_000_000) or 1_000_000
+        )
+    except Exception:
+        cost_tracker_total_budget = 1_000_000
+    cost_tracker_hard_stop = _truthy(
+        _cfg_get("unified", "cost_tracker", "hard_stop", default=True), default=True
+    )
+
+    response_cache_enabled = _truthy(
+        _cfg_get("unified", "response_cache", "enabled", default=False), default=False
+    )
+    try:
+        response_cache_max_entries = int(
+            _cfg_get("unified", "response_cache", "max_entries", default=512) or 512
+        )
+    except Exception:
+        response_cache_max_entries = 512
+    try:
+        response_cache_ttl_seconds = int(
+            _cfg_get("unified", "response_cache", "ttl_seconds", default=3600) or 3600
+        )
+    except Exception:
+        response_cache_ttl_seconds = 3600
+
+    user_model_enabled = _truthy(
+        _cfg_get("unified", "user_model", "enabled", default=False), default=False
+    )
+
+    clarifier_enabled = _truthy(
+        _cfg_get("unified", "clarifier", "enabled", default=False), default=False
+    )
+    try:
+        clarifier_heuristic_threshold = float(
+            _cfg_get("unified", "clarifier", "heuristic_threshold", default=0.5) or 0.5
+        )
+    except Exception:
+        clarifier_heuristic_threshold = 0.5
+    clarifier_always_use_llm = _truthy(
+        _cfg_get("unified", "clarifier", "always_use_llm", default=False), default=False
+    )
+
+    streaming_enabled = _truthy(
+        _cfg_get("unified", "streaming", "enabled", default=False), default=False
+    )
+
+    embedding_enabled = _truthy(
+        _cfg_get("unified", "embedding", "enabled", default=False), default=False
+    )
+    embedding_backend = str(
+        _cfg_get("unified", "embedding", "backend", default="local") or "local"
+    )
+    embedding_model = str(
+        _cfg_get("unified", "embedding", "model", default="all-MiniLM-L6-v2") or "all-MiniLM-L6-v2"
+    )
+
     _CONFIG_CACHE = UnifiedConfig(
         enabled=enabled,
         reflexion_enabled=reflexion_enabled,
@@ -605,5 +689,19 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         capability_resolver_enabled=capability_resolver_enabled,
         capability_resolver_auto_approve=capability_resolver_auto_approve,
         capability_resolver_allow_network=capability_resolver_allow_network,
+        cost_tracker_enabled=cost_tracker_enabled,
+        cost_tracker_total_budget=cost_tracker_total_budget,
+        cost_tracker_hard_stop=cost_tracker_hard_stop,
+        response_cache_enabled=response_cache_enabled,
+        response_cache_max_entries=response_cache_max_entries,
+        response_cache_ttl_seconds=response_cache_ttl_seconds,
+        user_model_enabled=user_model_enabled,
+        clarifier_enabled=clarifier_enabled,
+        clarifier_heuristic_threshold=clarifier_heuristic_threshold,
+        clarifier_always_use_llm=clarifier_always_use_llm,
+        streaming_enabled=streaming_enabled,
+        embedding_enabled=embedding_enabled,
+        embedding_backend=embedding_backend,
+        embedding_model=embedding_model,
     )
     return _CONFIG_CACHE

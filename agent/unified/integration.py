@@ -103,6 +103,50 @@ from .capability_resolver import (
     remove_auto_tool,
     resolve_capability,
 )
+# v3.1 Tier 1-2 upgrades
+from .cost_tracker import (
+    BudgetConfig,
+    CostTracker,
+    check_cost_budget,
+    configure_tracker,
+    get_cost_summary,
+    get_tracker,
+    reset_cost_tracker,
+    tracked_llm_call,
+)
+from .response_cache import (
+    ResponseCache,
+    cached_llm_call,
+    clear_response_cache,
+    configure_cache,
+    get_cache,
+    get_cache_stats,
+)
+from .user_model import (
+    UserModel,
+    configure_user_model,
+    get_user_model,
+    get_user_profile_block,
+    observe_user_message,
+    record_user_correction,
+    user_model_stats,
+)
+from .clarifier import (
+    Clarifier,
+    assess_ambiguity,
+    configure_clarifier,
+    get_clarifier,
+)
+from .embedding import (
+    Embedder,
+    configure_embedder,
+    embed,
+    embed_batch,
+    embedding_stats,
+    get_embedder,
+    semantic_search,
+    semantic_similarity,
+)
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None
@@ -892,6 +936,41 @@ def configure_reasoning_stack(
             llm_call=llm_call,
             auto_approve=cfg.capability_resolver_auto_approve,
             allow_network=cfg.capability_resolver_allow_network,
+        )
+
+    # v3.1 Tier 1-2 upgrades
+    # Cost tracker — always configure if enabled (pure data, no LLM).
+    if cfg.cost_tracker_enabled:
+        budget = BudgetConfig(
+            total_token_budget=cfg.cost_tracker_total_budget,
+            hard_stop=cfg.cost_tracker_hard_stop,
+        )
+        configure_tracker(budget=budget)
+
+    # Response cache — always configure if enabled (pure data, no LLM).
+    if cfg.response_cache_enabled:
+        configure_cache(
+            max_entries=cfg.response_cache_max_entries,
+            ttl_seconds=cfg.response_cache_ttl_seconds,
+        )
+
+    # User model — always configure if enabled (file-based, no LLM).
+    if cfg.user_model_enabled:
+        configure_user_model()
+
+    # Clarifier — needs LLM for ambiguity assessment.
+    if cfg.clarifier_enabled:
+        configure_clarifier(
+            llm_call=llm_call,
+            heuristic_threshold=cfg.clarifier_heuristic_threshold,
+            always_use_llm=cfg.clarifier_always_use_llm,
+        )
+
+    # Embedding — configure backend (lazy-loads model on first use).
+    if cfg.embedding_enabled:
+        configure_embedder(
+            backend=cfg.embedding_backend,  # type: ignore[arg-type]
+            model_name=cfg.embedding_model,
         )
 
 

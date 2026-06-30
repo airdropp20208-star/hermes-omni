@@ -49,6 +49,13 @@ def _set_last_user_message(msg: str) -> None:
     """Set the current user message (called from conversation_loop)."""
     global _last_user_message
     _last_user_message = msg or ""
+    # Also feed the user model for profile building.
+    try:
+        from agent.unified.integration import observe_user_message
+
+        observe_user_message(msg or "")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +184,7 @@ def augment_volatile_prompt(agent: Any, user_message: Optional[str] = None) -> s
 
     Injects (only if enabled and available):
         - Constitution principles
+        - User profile (expertise, style, domains)
         - Tool suggestions for current user message
         - Task plan progress (active plan)
         - Distilled context (insights from conversation)
@@ -196,6 +204,16 @@ def augment_volatile_prompt(agent: Any, user_message: Optional[str] = None) -> s
         from agent.unified.integration import get_constitution_prompt_block
 
         block = get_constitution_prompt_block()
+        if block:
+            blocks.append(block)
+    except Exception:
+        pass
+
+    # User profile (expertise, style, domains).
+    try:
+        from agent.unified.integration import get_user_profile_block
+
+        block = get_user_profile_block()
         if block:
             blocks.append(block)
     except Exception:
