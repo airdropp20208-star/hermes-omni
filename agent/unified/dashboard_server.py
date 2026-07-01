@@ -357,7 +357,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>Hermes-Omni</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#faf9f7;--card:#fff;--border:#e8e6e1;--text:#1a1a1a;--dim:#6b6b6b;--muted:#999;--accent:#c8860d;--green:#5a8a3a;--red:#c44d4d;--blue:#4a7ba8;--sidebar:#f5f3ef;--hover:#edeae3}
+:root{--bg:#f5f0e8;--card:#faf6ef;--border:#e0d5c3;--text:#3d3528;--dim:#7a6f5c;--muted:#a89a82;--accent:#c8860d;--green:#5a8a3a;--red:#c44d4d;--blue:#4a7ba8;--sidebar:#ede5d6;--hover:#e5dcc9}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex}
 .sidebar{width:56px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:.8rem 0;gap:.3rem;position:sticky;top:0;height:100vh}
 .nav-btn{width:38px;height:38px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;cursor:pointer;border:none;background:none;color:var(--dim);transition:.15s}
