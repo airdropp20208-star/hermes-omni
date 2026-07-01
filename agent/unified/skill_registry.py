@@ -570,28 +570,106 @@ class SkillRegistry:
         self._load_catalog()
 
     def _load_catalog(self) -> None:
-        """Load curated catalog + scan cache for installed skills."""
+        """Load curated catalog + scan local repos + scan cache for installed."""
+        # 1. Curated remote skills (download on demand).
         for entry_data in CURATED_SKILLS:
             entry = SkillEntry(**entry_data)
-            # Check if already cached.
             cache_path = self._cache_dir / entry.id / "SKILL.md"
             if cache_path.exists():
                 entry.installed = True
                 entry.install_path = str(cache_path)
-                # Try to read version from SKILL.md frontmatter.
                 try:
                     content = cache_path.read_text(encoding="utf-8", errors="ignore")
                     if content.startswith("---"):
                         end = content.find("---", 3)
                         if end > 0:
-                            frontmatter = content[3:end]
-                            for line in frontmatter.splitlines():
+                            for line in content[3:end].splitlines():
                                 if line.strip().startswith("version:"):
                                     entry.version = line.split(":", 1)[1].strip()
                                     break
                 except Exception:
                     pass
             self._catalog[entry.id] = entry
+
+        # 2. Scan local repos for SKILL.md files (lazy — catalog only, load on demand).
+        self._scan_local_repos()
+
+    def _scan_local_repos(self) -> None:
+        """Scan skills/local-repos/ for SKILL.md files.
+        Catalogs them as 'local' skills. Content is NOT loaded until
+        skill_load() is called (lazy loading).
+        """
+        # Find local-repos directory relative to this package.
+        # Path: agent/unified/skill_registry.py → ../../skills/local-repos/
+        package_dir = Path(__file__).parent  # agent/unified/
+        repo_root = package_dir.parent.parent  # hermes-omni/
+        local_repos = repo_root / "skills" / "local-repos"
+        if not local_repos.exists():
+            return
+        for skill_md in local_repos.rglob("SKILL.md"):
+            try:
+                rel = skill_md.relative_to(local_repos)
+                parts = rel.parts
+                if len(parts) < 2:
+                    continue
+                repo_name = parts[0]  # e.g., "agent-skills"
+                # Build skill ID from path.
+                skill_name = parts[-2] if len(parts) >= 2 else skill_md.stem
+                skill_id = f"local-{repo_name}-{skill_name}"
+                if skill_id in self._catalog:
+                    skill_id = f"local-{repo_name}-{'-'.join(parts[1:-1])}"
+                # Read first 200 chars for description.
+                content = skill_md.read_text(encoding="utf-8", errors="ignore")[:500]
+                desc = ""
+                name_field = ""
+                if content.startswith("---"):
+                    end = content.find("---", 3)
+                    if end > 0:
+                        for line in content[3:end].splitlines():
+                            if line.strip().startswith("description:"):
+                                desc = line.split(":", 1)[1].strip().strip('"').strip("'")[:120]
+                            if line.strip().startswith("name:"):
+                                name_field = line.split(":", 1)[1].strip().strip('"').strip("'")
+                if not desc:
+                    # Use folder name as description.
+                    desc = f"Skill from {repo_name}/{skill_name}"
+                entry = SkillEntry(
+                    id=skill_id,
+                    repo=f"local/{repo_name}",
+                    subpath="/".join(parts[1:-1]) if len(parts) > 2 else "",
+                    desc=desc,
+                    category=self._guess_category(repo_name, skill_name, desc),
+                    stars="local",
+                    installed=True,  # Already on disk — just lazy load
+                    install_path=str(skill_md),
+                )
+                self._catalog[skill_id] = entry
+            except Exception:
+                continue
+
+    @staticmethod
+    def _guess_category(repo: str, name: str, desc: str) -> str:
+        """Guess category from repo name + skill name + description."""
+        combined = f"{repo} {name} {desc}".lower()
+        if any(w in combined for w in ["debug", "bug", "error", "traceback"]):
+            return "software-development"
+        if any(w in combined for w in ["test", "tdd", "qa"]):
+            return "software-development"
+        if any(w in combined for w in ["code", "refactor", "implement", "architecture"]):
+            return "software-development"
+        if any(w in combined for w in ["design", "ui", "ux", "frontend", "canvas"]):
+            return "creative"
+        if any(w in combined for w in ["research", "academic", "paper"]):
+            return "research"
+        if any(w in combined for w in ["doc", "writing", "article", "comms"]):
+            return "productivity"
+        if any(w in combined for w in ["security", "hardening"]):
+            return "security"
+        if any(w in combined for w in ["deploy", "ci", "cd", "shipping"]):
+            return "devops"
+        if any(w in combined for w in ["art", "image", "brand", "theme"]):
+            return "creative"
+        return "productivity"
 
     def list_available(self, *, category: str | None = None) -> list[SkillEntry]:
         """List all available skills (curated + installed)."""
