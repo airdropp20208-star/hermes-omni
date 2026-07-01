@@ -149,27 +149,27 @@ def _get_config() -> list[dict]:
     config = _read_yaml(HERMES_HOME / "config.yaml")
     unified = config.get("unified", {}) if config else {}
     fields = [
-        ("reasoning","unified.reasoning.enabled","Foundation","Plan → critique → execute → reflect"),
-        ("reflexion","unified.reflexion.enabled","Foundation","Learn from failures"),
-        ("smart_guardian","unified.smart_guardian.enabled","Guardians","LLM-as-judge guardian"),
-        ("verifier","unified.verifier.enabled","Guardians","Self-verification loop"),
-        ("constitution","unified.constitution.enabled","Guardians","User-defined principles"),
-        ("slow_thinking","unified.slow_thinking.enabled","Deep Reasoning","4 levels: fast/balanced/deep/max"),
-        ("ensemble","unified.ensemble.enabled","Advanced","Multi-model + judge (3x cost)"),
-        ("embedding","unified.embedding.enabled","Advanced","Semantic recall (+40%)"),
-        ("user_model","unified.user_model.enabled","Advanced","User profile personalization"),
-        ("clarifier","unified.clarifier.enabled","Advanced","Detect ambiguity + ask"),
-        ("longrun","unified.longrun.enabled","Infrastructure","Background work queue"),
-        ("tool_router","unified.tool_router.enabled","Infrastructure","Auto tool selection"),
-        ("cost_tracker","unified.cost_tracker.enabled","Infrastructure","Token accounting + budget"),
-        ("response_cache","unified.response_cache.enabled","Infrastructure","Cache LLM responses"),
-        ("output_formatter","unified.output_formatter.enabled","Infrastructure","Telegram/Slack formatting"),
-        ("skill_registry","unified.skill_registry.enabled","Registry","150 skills marketplace"),
-        ("api_registry","unified.api_registry.enabled","Registry","1500+ public APIs"),
-        ("multi_provider","unified.multi_provider.enabled","Multi-Provider","Aggregate LLM APIs"),
-        ("learning","unified.learning.enabled","Learning","Learn from every interaction"),
-        ("skill_synthesis","unified.skill_synthesis.enabled","Learning","Auto-create skills"),
-        ("task_planner","unified.task_planner.enabled","Planning","Task decomposition + tracking"),
+        ("reasoning","unified.reasoning.enabled","Nền tảng","Lập kế hoạch → đánh giá → thực hiện → rút kinh nghiệm"),
+        ("reflexion","unified.reflexion.enabled","Nền tảng","Học từ lỗi sai"),
+        ("smart_guardian","unified.smart_guardian.enabled","Bảo vệ","Bảo vệ thông minh (LLM đánh giá)"),
+        ("verifier","unified.verifier.enabled","Bảo vệ","Tự kiểm tra trước khi gửi"),
+        ("constitution","unified.constitution.enabled","Bảo vệ","Nguyên tắc đạo đức"),
+        ("slow_thinking","unified.slow_thinking.enabled","Suy luận sâu","4 mức: nhanh/cân bằng/sâu/tối đa"),
+        ("ensemble","unified.ensemble.enabled","Nâng cao","Nhiều mô hình + giám khảo (3x token)"),
+        ("embedding","unified.embedding.enabled","Nâng cao","Ghi nhớ thông minh (+40%)"),
+        ("user_model","unified.user_model.enabled","Nâng cao","Cá nhân hóa theo người dùng"),
+        ("clarifier","unified.clarifier.enabled","Nâng cao","Phát hiện mơ hồ → hỏi lại"),
+        ("longrun","unified.longrun.enabled","Hạ tầng","Chạy tác vụ nền"),
+        ("tool_router","unified.tool_router.enabled","Hạ tầng","Tự chọn công cụ"),
+        ("cost_tracker","unified.cost_tracker.enabled","Hạ tầng","Đếm token + ngân sách"),
+        ("response_cache","unified.response_cache.enabled","Hạ tầng","Lưu cache (tiết kiệm token)"),
+        ("output_formatter","unified.output_formatter.enabled","Hạ tầng","Định dạng Telegram/Slack"),
+        ("skill_registry","unified.skill_registry.enabled","Thư viện","Thư viện 113 kỹ năng"),
+        ("api_registry","unified.api_registry.enabled","Thư viện","1500+ API công khai"),
+        ("multi_provider","unified.multi_provider.enabled","Đa nhà cung cấp","Gộp nhiều API key"),
+        ("learning","unified.learning.enabled","Học tập","Học từ mọi tương tác"),
+        ("skill_synthesis","unified.skill_synthesis.enabled","Học tập","Tự tạo kỹ năng"),
+        ("task_planner","unified.task_planner.enabled","Lập kế hoạch","Chia task + theo dõi"),
     ]
     result = []
     for key, path, cat, desc in fields:
@@ -284,27 +284,27 @@ def _stop_gateway() -> dict:
 
 
 def _send_to_agent(message: str) -> dict:
-    """Send a message to the running agent and get response."""
-    global _agent_process
-    if _agent_process is None or _agent_process.poll() is not None:
-        return {"success": False, "error": "Agent not running. Start it first."}
+    """Send message via hermes -m one-shot mode."""
+    import subprocess, sys, os, re as _re
     try:
-        _agent_process.stdin.write((message + "\n").encode("utf-8"))
-        _agent_process.stdin.flush()
-        # Read response (non-blocking with timeout)
-        import select
-        readable, _, _ = select.select([_agent_process.stdout], [], [], 30)
-        if readable:
-            response = b""
-            while True:
-                chunk = _agent_process.stdout.read(4096)
-                if not chunk:
-                    break
-                response += chunk
-                if b"\n" in chunk:
-                    break
-            return {"success": True, "response": response.decode("utf-8", errors="ignore")}
-        return {"success": True, "response": "(agent processing...)"}
+        env = {**os.environ, "HERMES_HOME": str(HERMES_HOME)}
+        proc = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "-m", message, "--yolo"],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(REPO_ROOT), env=env,
+        )
+        if proc.returncode == 0:
+            output = proc.stdout.strip()
+            output = _re.sub(r'\x1b\[[0-9;]*m', '', output)
+            lines = output.split("\n")
+            resp = [l for l in lines if not any(s in l for s in ["\u274c","\u2713","\u2192","\u2139","\u26a0"])]
+            response = "\n".join(resp).strip() or output[-2000:]
+            return {"success": True, "response": response}
+        else:
+            err = (proc.stderr or proc.stdout or "Unknown").strip()[-500:]
+            return {"success": False, "error": f"L\u1ed7i: {err}"}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Agent h\u1ebft th\u1eddi gian (120s)"}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -683,7 +683,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <div class="main">
 <div class="topbar"><div class="topbar-title" id="vt">Trò chuyện</div><div class="topbar-actions">
 <span class="badge badge-g" id="as">● Agent</span><span class="badge badge-r" id="gs">GW: Off</span>
-<button class="btn btn-h" onclick="startGW()" style="font-size:.6rem">Start GW</button></div></div>
+<button class="btn btn-h" onclick="startGW()" style="font-size:.6rem">Bật Gateway</button></div></div>
 <div id="chat" class="chat-view active"><div class="chat-msgs" id="cm"><div class="msg sys">💬 Trò chuyện với Hermes. Agent tự khởi động khi bật bảng điều khiển.</div></div>
 <div class="chat-bottom"><div class="file-area" id="fa" onclick="document.getElementById('fi').click()">📎 Kéo thả hoặc click<input type="file" id="fi" multiple style="display:none" onchange="upF(this.files)"></div><div class="file-list" id="fl"></div>
 <div class="mode-bar">
@@ -761,11 +761,11 @@ function fn(n){return n>1e6?(n/1e6).toFixed(1)+'M':n>1e3?(n/1e3).toFixed(0)+'K':
 async function ca(){const s=await api('agent-status');const e=document.getElementById('as');if(s&&s.running){e.className='badge badge-g';e.textContent='● PID:'+s.pid}else{e.className='badge badge-r';e.textContent='● Off'}}
 async function startAgent(){const r=await post('start-agent');if(r&&r.success){addM('sys','🟢 '+r.message);ca()}else addM('sys','❌ '+(r?r.error:'Fail'))}
 async function stopAgent(){const r=await post('stop-agent');if(r&&r.success){addM('sys','🔴 Stopped');ca()}}
-async function startGW(){const r=await post('start-gateway');const e=document.getElementById('gs');if(r&&r.success){e.className='badge badge-g';e.textContent='GW: On'}else addM('sys','❌ '+(r?r.error:'Fail'))}
+async function startGW(){const r=await post('start-gateway');const e=document.getElementById('gs');if(r&&r.success){e.className='badge badge-g';e.textContent='GW: Bật'}else addM('sys','❌ '+(r?r.error:'Fail'))}
 async function ref(){const s=await api('status');if(!s)return;document.getElementById('sc').innerHTML='<div class="sc"><div class="sl">Providers</div><div class="sv">'+s.providers+'</div><div class="ss">'+s.activeKeys+' keys</div></div><div class="sc"><div class="sl">Skills</div><div class="sv">'+s.installedSkills+'</div><div class="ss">installed</div></div><div class="sc"><div class="sl">Features</div><div class="sv">'+s.enabledFeatures+'/'+s.totalFeatures+'</div><div class="ss">enabled</div></div><div class="sc"><div class="sl">Tokens</div><div class="sv">'+fn(s.totalCostTokens)+'</div><div class="ss">'+s.totalCalls+' calls</div></div>'}
 async function rP(){const p=await api('providers');if(!p)return;document.getElementById('pl').innerHTML=p.map(pr=>'<div class="pc"><div style="font-weight:700;font-size:.85rem">'+pr.name+'</div><div style="font-size:.6rem;color:var(--muted);font-family:monospace">'+pr.baseUrl+'</div><div style="margin:.15rem 0">'+pr.models.map(m=>'<span class="mb">'+m+'</span>').join('')+'</div>'+pr.keys.map(k=>{const pct=k.quota>0?Math.round(k.used/k.quota*100):0;const c=pct>80?'r':pct>50?'y':'g';const st=k.exhausted?'exhausted':k.enabled?'active':'disabled';return '<div class="kr"><span class="kp">'+k.keyPreview+'</span><div class="qb"><div class="qf '+c+'" style="width:'+Math.max(pct,2)+'%"></div></div><span class="ks '+st+'">'+st+'</span></div>'}).join('')+'<button class="btn btn-h" style="font-size:.6rem;margin-top:.15rem" onclick="addK(\''+pr.id+'\')">+ Add Key</button></div>').join('')}
 async function rC(){const c=await api('config');if(!c)return;const g={};c.forEach(f=>{if(!g[f.category])g[f.category]=[];g[f.category].push(f)});let h='';for(const[cat,fs]of Object.entries(g)){const en=fs.filter(f=>f.enabled).length;h+='<div style="margin-bottom:.6rem"><div style="font-weight:700;color:var(--accent);font-size:.7rem;text-transform:uppercase;margin-bottom:.15rem">'+cat+' ('+en+'/'+fs.length+')</div>'+fs.map(f=>'<div class="cf"><div><div class="cfp">'+f.path+'</div><div class="cfd">'+f.description+'</div></div><div class="tg '+(f.enabled?'on':'')+'" onclick="tc(\''+f.path+'\',this)"></div></div>').join('')+'</div>'}document.getElementById('cl').innerHTML=h}
-async function rS(){const s=await api('skills');if(!s)return;document.getElementById('sl').innerHTML=s.map(sk=>'<div class="skc"><div class="skn">'+sk.id+'</div><div class="skr">'+sk.repo+'</div><div class="skde">'+sk.desc+'</div></div>').join('')}
+async function rS(){const s=await api('skills');if(!s)return;let h='<div class="card"><b>📚 Thư viện kỹ năng</b><br><span style="font-size:.75rem;color:var(--dim)">'+s.length+' kỹ năng. Agent tự tìm khi cần.</span></div><div class="card">';s.slice(0,30).forEach(sk=>{const sn=sk.id.replace('local-','').replace('claude-','').replace('senior-','');h+='<div style="padding:.2rem 0;font-size:.72rem;border-bottom:1px solid var(--border)"><b>'+sn+'</b> <span style="color:var(--muted)">'+sk.desc.substring(0,60)+'</span></div>'});if(s.length>30)h+='<div style="text-align:center;padding:.3rem;color:var(--accent);font-size:.7rem">+'+(s.length-30)+' kỹ năng khác</div>';h+='</div>';document.getElementById('sl').innerHTML=h}
 async function rCost(){const c=await api('costs');if(!c)return;const max=Math.max(...c.map(x=>x.tokens),1);document.getElementById('cs').innerHTML='<div class="sg"><div class="sc"><div class="sl">Tokens</div><div class="sv">'+fn(c.reduce((s,x)=>s+x.tokens,0))+'</div></div><div class="sc"><div class="sl">Calls</div><div class="sv">'+c.reduce((s,x)=>s+x.calls,0)+'</div></div></div><div class="card"><div style="display:flex;align-items:flex-end;gap:.2rem;height:140px">'+c.map(x=>{const h=Math.round(x.tokens/max*120);return '<div style="flex:1;background:var(--accent);border-radius:3px 3px 0 0;height:'+h+'px;min-height:2px;position:relative"><div style="position:absolute;top:-10px;left:50%;transform:translateX(-50%);font-size:.5rem;color:var(--dim)">'+fn(x.tokens)+'</div><div style="position:absolute;bottom:-12px;left:50%;transform:translateX(-50%);font-size:.45rem;color:var(--muted);white-space:nowrap">'+x.phase+'</div></div>'}).join('')+'</div></div>'}
 async function rL(){const l=await api('logs');if(!l)return;document.getElementById('lf').innerHTML=l.map(x=>'<div style="display:flex;gap:.2rem;padding:.1rem;font-size:.65rem;border-bottom:1px solid var(--border)"><span style="font-family:monospace;color:var(--muted)">'+x.timestamp+'</span><span style="font-weight:700;color:var(--'+(x.level==='success'?'green':x.level==='error'?'red':x.level==='warn'?'#d4a017':'blue')+'")">'+x.level.toUpperCase()+'</span><span style="color:var(--accent);font-family:monospace">'+x.module+'</span><span style="flex:1">'+x.message+'</span></div>').join('')}
 async function tc(p,el){const r=await post('toggle-config',{path:p});if(r&&r.success){el.classList.toggle('on');ref()}}
