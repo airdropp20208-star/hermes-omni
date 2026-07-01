@@ -250,6 +250,26 @@ def augment_volatile_prompt(agent: Any, user_message: Optional[str] = None) -> s
     except Exception:
         pass
 
+    # v4: Context Hologram (project overview in ~500 tokens)
+    try:
+        from agent.unified.integration import get_hologram
+        import os
+        hologram = get_hologram(os.getcwd())
+        if hologram:
+            blocks.append(hologram)
+    except Exception:
+        pass
+
+    # v4: Golden Path (distilled trajectory)
+    if user_message:
+        try:
+            from agent.unified.integration import recall_golden_path
+            golden = recall_golden_path(user_message)
+            if golden:
+                blocks.append(golden)
+        except Exception:
+            pass
+
     # Recalled learnings.
     if user_message:
         try:

@@ -170,6 +170,29 @@ from .api_registry import (
     list_apis_by_category,
     search_apis,
 )
+# v4 Breakthrough modules
+from .failure_forecast import (
+    FailureForecast, configure_forecast, forecast_now, forecast_stats,
+    record_and_forecast, get_forecast,
+)
+from .trajectory_distiller import (
+    TrajectoryDistillery, configure_distiller, distillery_stats,
+    start_trajectory_task, record_trajectory_step, finish_trajectory_task,
+    recall_golden_path, get_distiller,
+)
+from .context_hologram import (
+    get_hologram, hologram_stats, build_hologram,
+)
+from .skill_evolution import (
+    SkillEvolution, configure_evolution, evolution_stats,
+    register_skill_for_evolution, record_skill_feedback, get_evolved_skill,
+)
+from .persona_split import (
+    PersonaSplitSolver, configure_solver, persona_solve, persona_stats,
+)
+from .harness import (
+    AgentHarness, ToolCall, configure_harness, run_harness, harness_stats,
+)
 # v3.3 Multi-Provider Gateway
 from .multi_provider import (
     MultiProviderGateway,

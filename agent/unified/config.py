@@ -201,6 +201,14 @@ class UnifiedConfig:
     multi_provider_enabled: bool = False
     multi_provider_strategy: str = "round-robin"  # round-robin | least-used | failover-only
     multi_provider_server_port: int = 8787
+    # --- v4 Breakthrough ---
+    failure_forecast_enabled: bool = True
+    trajectory_distiller_enabled: bool = True
+    context_hologram_enabled: bool = True
+    skill_evolution_enabled: bool = True
+    persona_split_enabled: bool = False
+    harness_enabled: bool = True
+    harness_max_parallel: int = 4
 
 
 _CONFIG_CACHE: UnifiedConfig | None = None
@@ -664,6 +672,32 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
     except Exception:
         multi_provider_server_port = 8787
 
+    # --- v4 Breakthrough config ---
+    failure_forecast_enabled = _truthy(
+        _cfg_get("unified", "failure_forecast", "enabled", default=True), default=True
+    )
+    trajectory_distiller_enabled = _truthy(
+        _cfg_get("unified", "trajectory_distiller", "enabled", default=True), default=True
+    )
+    context_hologram_enabled = _truthy(
+        _cfg_get("unified", "context_hologram", "enabled", default=True), default=True
+    )
+    skill_evolution_enabled = _truthy(
+        _cfg_get("unified", "skill_evolution", "enabled", default=True), default=True
+    )
+    persona_split_enabled = _truthy(
+        _cfg_get("unified", "persona_split", "enabled", default=False), default=False
+    )
+    harness_enabled = _truthy(
+        _cfg_get("unified", "harness", "enabled", default=True), default=True
+    )
+    try:
+        harness_max_parallel = int(
+            _cfg_get("unified", "harness", "max_parallel", default=4) or 4
+        )
+    except Exception:
+        harness_max_parallel = 4
+
     _CONFIG_CACHE = UnifiedConfig(
         enabled=enabled,
         reflexion_enabled=reflexion_enabled,
@@ -748,5 +782,12 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         multi_provider_enabled=multi_provider_enabled,
         multi_provider_strategy=multi_provider_strategy,
         multi_provider_server_port=multi_provider_server_port,
+        failure_forecast_enabled=failure_forecast_enabled,
+        trajectory_distiller_enabled=trajectory_distiller_enabled,
+        context_hologram_enabled=context_hologram_enabled,
+        skill_evolution_enabled=skill_evolution_enabled,
+        persona_split_enabled=persona_split_enabled,
+        harness_enabled=harness_enabled,
+        harness_max_parallel=harness_max_parallel,
     )
     return _CONFIG_CACHE
