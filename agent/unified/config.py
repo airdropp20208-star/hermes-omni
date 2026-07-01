@@ -187,6 +187,14 @@ class UnifiedConfig:
     embedding_enabled: bool = False
     embedding_backend: str = "local"  # "local" | "openai" | "none"
     embedding_model: str = "all-MiniLM-L6-v2"
+    # --- v3.2 Skill + API Registry ---
+    # SkillRegistry: curated marketplace of 25+ skills from 18 GitHub repos.
+    # Agent can search/install/load skills on-demand.
+    skill_registry_enabled: bool = True  # safe default — no LLM cost
+    # APIRegistry: 1500+ public APIs (from public-apis/public-apis).
+    # Agent can search/call APIs without memorizing URLs.
+    api_registry_enabled: bool = True  # safe default — no LLM cost
+    api_registry_auto_fetch: bool = False  # download full 1500+ catalog on first use
 
 
 _CONFIG_CACHE: UnifiedConfig | None = None
@@ -625,6 +633,17 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         _cfg_get("unified", "embedding", "model", default="all-MiniLM-L6-v2") or "all-MiniLM-L6-v2"
     )
 
+    # --- v3.2 Skill + API Registry config ---
+    skill_registry_enabled = _truthy(
+        _cfg_get("unified", "skill_registry", "enabled", default=True), default=True
+    )
+    api_registry_enabled = _truthy(
+        _cfg_get("unified", "api_registry", "enabled", default=True), default=True
+    )
+    api_registry_auto_fetch = _truthy(
+        _cfg_get("unified", "api_registry", "auto_fetch", default=False), default=False
+    )
+
     _CONFIG_CACHE = UnifiedConfig(
         enabled=enabled,
         reflexion_enabled=reflexion_enabled,
@@ -703,5 +722,8 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         embedding_enabled=embedding_enabled,
         embedding_backend=embedding_backend,
         embedding_model=embedding_model,
+        skill_registry_enabled=skill_registry_enabled,
+        api_registry_enabled=api_registry_enabled,
+        api_registry_auto_fetch=api_registry_auto_fetch,
     )
     return _CONFIG_CACHE

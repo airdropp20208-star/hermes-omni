@@ -147,6 +147,29 @@ from .embedding import (
     semantic_search,
     semantic_similarity,
 )
+# v3.2 Skill + API Registry
+from .skill_registry import (
+    SkillRegistry,
+    get_registry as get_skill_registry,
+    install_skill,
+    list_available_skills,
+    list_installed_skills,
+    load_skill,
+    search_skills,
+    skill_registry_stats,
+    uninstall_skill,
+)
+from .api_registry import (
+    APIRegistry,
+    api_registry_stats,
+    call_api,
+    fetch_full_api_catalog,
+    get_api_info,
+    get_api_registry,
+    list_api_categories,
+    list_apis_by_category,
+    search_apis,
+)
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None
