@@ -388,38 +388,65 @@ def _action_set_mode(data: dict) -> dict:
 
 
 def _action_setup_provider(data: dict) -> dict:
-    """Setup LLM provider from dashboard — writes to config.yaml + .env."""
+    """Setup LLM provider — syncs with hermes config.yaml + .env + provider profiles.
+
+    This writes the SAME format that `hermes setup` / `hermes model` uses:
+    - config.yaml: model.provider, model.default, model.base_url
+    - .env: PROVIDER_API_KEY=xxx
+    - Also writes to provider profile if using plugins/model-providers
+    """
     provider = data.get("provider", "")
     api_key = data.get("apiKey", "")
     model = data.get("model", "")
     base_url = data.get("baseUrl", "")
     if not provider or not api_key:
-        return {"success": False, "error": "provider and apiKey required"}
+        return {"success": False, "error": "Vui lòng chọn nhà cung cấp và nhập API key"}
 
     config_path = HERMES_HOME / "config.yaml"
     config = _read_yaml(config_path) or {}
-    # Set model config
+
+    # Set model config (same format as hermes model command)
     model_cfg = config.setdefault("model", {})
     model_cfg["provider"] = provider
     if model:
         model_cfg["default"] = model
     if base_url:
         model_cfg["base_url"] = base_url
+
+    # Map provider to env var name (same as hermes_cli/auth.py)
+    PROVIDER_ENV_KEYS = {
+        "zai": "ZAI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "custom": "CUSTOM_API_KEY",
+    }
+    key_var = PROVIDER_ENV_KEYS.get(provider, f"{provider.upper().replace('-', '_')}_API_KEY")
+
     # Save API key to .env
     env_path = HERMES_HOME / ".env"
     env_lines = []
     if env_path.exists():
         env_lines = env_path.read_text(encoding="utf-8").splitlines()
     # Remove old key for this provider
-    key_var = f"{provider.upper().replace('-', '_')}_API_KEY"
     env_lines = [l for l in env_lines if not l.startswith(f"{key_var}=")]
     env_lines.append(f"{key_var}={api_key}")
+
+    # Also set HERMES_INFERENCE_PROVIDER env
+    env_lines = [l for l in env_lines if not l.startswith("HERMES_INFERENCE_PROVIDER=")]
+    env_lines.append(f"HERMES_INFERENCE_PROVIDER={provider}")
+
     try:
         import yaml
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True), encoding="utf-8")
         env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
-        return {"success": True, "message": f"Provider {provider} configured (model={model or 'default'}, key={api_key[:4]}...{api_key[-4:]})"}
+        return {
+            "success": True,
+            "message": f"Đã lưu! Provider: {provider}, Model: {model or 'mặc định'}, Key: {api_key[:4]}...{api_key[-4:]}",
+            "config": _get_config(),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -609,23 +636,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 @media(max-width:768px){body{flex-direction:column}.sidebar{width:100%;height:auto;flex-direction:row;position:sticky;top:0;border-right:none;border-bottom:1px solid var(--border);padding:.4rem;gap:.2rem}.nav-spacer{display:none}.main{height:calc(100vh - 52px)}}
 </style></head><body>
 <nav class="sidebar">
-<button class="nav-btn active" onclick="nv(event,'chat')" title="Chat">💬</button>
+<button class="nav-btn active" onclick="nv(event,'chat')" title="Trò chuyện">💬</button>
 <button class="nav-btn" onclick="nv(event,'overview')" title="Tổng quan">📊</button>
-<button class="nav-btn" onclick="nv(event,'providers')" title="Provider">🔌</button>
-<button class="nav-btn" onclick="nv(event,'config')" title="Cấu hình">⚙️</button>
-<button class="nav-btn" onclick="nv(event,'skills')" title="Kỹ năng">📚</button>
-<button class="nav-btn" onclick="nv(event,'costs')" title="Chi phí">💰</button>
-<button class="nav-btn" onclick="nv(event,'logs')" title="Nhật ký">📋</button>
-<button class="nav-btn" onclick="nv(event,'json')" title="JSON">🔧</button>
+<button class="nav-btn" onclick="nv(event,'providers')" title="Nhà cung cấp API">🔌</button>
+<button class="nav-btn" onclick="nv(event,'config')" title="Cấu hình tính năng">⚙️</button>
+<button class="nav-btn" onclick="nv(event,'skills')" title="Thư viện kỹ năng">📚</button>
+<button class="nav-btn" onclick="nv(event,'costs')" title="Thống kê chi phí">💰</button>
+<button class="nav-btn" onclick="nv(event,'logs')" title="Nhật ký hoạt động">📋</button>
 <div class="nav-spacer"></div>
 <button class="nav-btn" onclick="startAgent()" title="Start" style="color:var(--green)">▶</button>
 <button class="nav-btn" onclick="stopAgent()" title="Stop" style="color:var(--red)">⏹</button>
 </nav>
 <div class="main">
-<div class="topbar"><div class="topbar-title" id="vt">Chat</div><div class="topbar-actions">
+<div class="topbar"><div class="topbar-title" id="vt">Trò chuyện</div><div class="topbar-actions">
 <span class="badge badge-g" id="as">● Agent</span><span class="badge badge-r" id="gs">GW: Off</span>
 <button class="btn btn-h" onclick="startGW()" style="font-size:.6rem">Start GW</button></div></div>
-<div id="chat" class="chat-view active"><div class="chat-msgs" id="cm"><div class="msg sys">Chat với Hermes. Agent tự khởi động.</div></div>
+<div id="chat" class="chat-view active"><div class="chat-msgs" id="cm"><div class="msg sys">💬 Trò chuyện với Hermes. Agent tự khởi động khi bật bảng điều khiển.</div></div>
 <div class="chat-bottom"><div class="file-area" id="fa" onclick="document.getElementById('fi').click()">📎 Kéo thả hoặc click<input type="file" id="fi" multiple style="display:none" onchange="upF(this.files)"></div><div class="file-list" id="fl"></div>
 <div class="mode-bar">
 <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
@@ -652,37 +678,37 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <div id="overview" class="view"><div class="sg" id="sc"></div></div>
 <div id="providers" class="view"><div id="pl"></div>
 <div class="card" style="margin-top:.5rem">
-<b>🔑 Setup API Key nhanh</b><br><br>
+<b>🔑 Thiết lập API Key</b><br><span style="font-size:.7rem;color:var(--muted)">Cấu hình nhà cung cấp AI cho agent</span><br><br>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
 <select id="sp-provider" class="search" style="margin:0">
-<option value="">Chọn provider...</option>
-<option value="zai">GLM (z.ai) — FREE</option>
-<option value="openai">OpenAI</option>
+<option value="">Chọn nhà cung cấp...</option>
+<option value="zai">GLM (z.ai) — Miễn phí</option>
+<option value="openai">OpenAI (GPT)</option>
 <option value="anthropic">Anthropic (Claude)</option>
-<option value="openrouter">OpenRouter</option>
+<option value="openrouter">OpenRouter (nhiều model)</option>
 <option value="deepseek">DeepSeek</option>
-<option value="custom">Custom</option>
+<option value="custom">Tùy chỉnh</option>
 </select>
 <input id="sp-model" class="search" style="margin:0" placeholder="Model (vd: glm-4.6)">
 <input id="sp-baseurl" class="search" style="margin:0" placeholder="Base URL (vd: https://open.bigmodel.cn/api/paas/v4)">
 <input id="sp-apikey" class="search" style="margin:0" type="password" placeholder="API Key">
 </div>
 <div style="display:flex;gap:.3rem;margin-top:.4rem">
-<button class="btn btn-p" onclick="setupProvider()">💾 Lưu config</button>
-<button class="btn btn-h" onclick="testKey()">🧪 Test key</button>
+<button class="btn btn-p" onclick="setupProvider()">💾 Lưu cấu hình</button>
+<button class="btn btn-h" onclick="testKey()">🧪 Kiểm tra key</button>
 </div>
 <div id="sp-result" style="font-size:.7rem;margin-top:.3rem;color:var(--dim)"></div>
 </div>
-<button class="btn btn-h" onclick="addP()" style="margin-top:.5rem">+ Thêm Provider (multi_provider.yaml)</button>
+<button class="btn btn-h" onclick="addP()" style="margin-top:.5rem">+ Thêm nhà cung cấp (nhiều key)</button>
 </div>
 <div id="config" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fc(this.value)"><div id="cl"></div></div>
 <div id="skills" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fs(this.value)"><div id="sl" class="sk-grid"></div></div>
 <div id="costs" class="view"><div id="cs"></div></div>
 <div id="logs" class="view"><div class="card" style="max-height:400px;overflow:auto" id="lf"></div></div>
-<div id="json" class="view"><div class="card"><b>JSON Formatter</b><br><textarea class="json-in" id="ji" placeholder="Paste JSON..." oninput="fj()"></textarea><input class="search" style="margin-top:.2rem" id="jf" placeholder="Filter key..." oninput="fj()"><div class="json-out" id="jo">Kết quả...</div></div></div>
+
 </div></div>
 <script>
-const T={chat:'Chat',overview:'Tổng quan',providers:'Provider',config:'Cấu hình',skills:'Kỹ năng',costs:'Chi phí',logs:'Nhật ký',json:'JSON Tool'};
+const T={chat:'Trò chuyện',overview:'Tổng quan',providers:'Nhà cung cấp API',config:'Cấu hình',skills:'Kỹ năng',costs:'Chi phí',logs:'Nhật ký hoạt động'};
 let msgs=[],cnt=25;
 let curMode={thinking:'balanced',reasoning:'standard',verify:'on'};
 function setMode(type,val,btn){document.querySelectorAll('.mode-group').forEach(g=>{if(g.querySelector('.mode-label').textContent.toLowerCase().includes(type==='thinking'?'thinking':type==='reasoning'?'reasoning':'verify')){g.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'))}});btn.classList.add('active');curMode[type]=val;const info=document.getElementById('mode-info');info.textContent=curMode.thinking+' · '+curMode.reasoning+' · '+(curMode.verify==='on'?'verify':'no-verify');post('set-mode',curMode).then(r=>{if(r&&r.success)addM('sys','⚙️ '+type+' = '+val)})}
