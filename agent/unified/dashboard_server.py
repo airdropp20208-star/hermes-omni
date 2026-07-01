@@ -357,39 +357,183 @@ def _action_set_mode(data: dict) -> dict:
     config_path = HERMES_HOME / "config.yaml"
     config = _read_yaml(config_path) or {}
     unified = config.setdefault("unified", {})
-    # Thinking level
     st = unified.setdefault("slow_thinking", {})
     if thinking == "fast":
         st["enabled"] = False
     else:
         st["enabled"] = True
         st["default_level"] = thinking
-    # Reasoning level
     sr = unified.setdefault("reasoning", {})
     if reasoning == "off":
         sr["enabled"] = False
     else:
         sr["enabled"] = True
-        # "standard" = default, "high" = slow_thinking deep, "max" = slow_thinking max
         if reasoning == "high":
             st["enabled"] = True
             st["default_level"] = "deep"
         elif reasoning == "max":
             st["enabled"] = True
             st["default_level"] = "max"
-    # Verify
     sv = unified.setdefault("verifier", {})
     sv["enabled"] = verify == "on"
-    # Also toggle smart_guardian with verify
     sg = unified.setdefault("smart_guardian", {})
     sg["enabled"] = verify == "on"
     try:
         import yaml
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True), encoding="utf-8")
-        return {"success": True, "message": f"Mode set: thinking={thinking}, reasoning={reasoning}, verify={verify}", "config": _get_config()}
+        return {"success": True, "message": f"Mode: thinking={thinking}, reasoning={reasoning}, verify={verify}", "config": _get_config()}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _action_setup_provider(data: dict) -> dict:
+    """Setup LLM provider from dashboard — writes to config.yaml + .env."""
+    provider = data.get("provider", "")
+    api_key = data.get("apiKey", "")
+    model = data.get("model", "")
+    base_url = data.get("baseUrl", "")
+    if not provider or not api_key:
+        return {"success": False, "error": "provider and apiKey required"}
+
+    config_path = HERMES_HOME / "config.yaml"
+    config = _read_yaml(config_path) or {}
+    # Set model config
+    model_cfg = config.setdefault("model", {})
+    model_cfg["provider"] = provider
+    if model:
+        model_cfg["default"] = model
+    if base_url:
+        model_cfg["base_url"] = base_url
+    # Save API key to .env
+    env_path = HERMES_HOME / ".env"
+    env_lines = []
+    if env_path.exists():
+        env_lines = env_path.read_text(encoding="utf-8").splitlines()
+    # Remove old key for this provider
+    key_var = f"{provider.upper().replace('-', '_')}_API_KEY"
+    env_lines = [l for l in env_lines if not l.startswith(f"{key_var}=")]
+    env_lines.append(f"{key_var}={api_key}")
+    try:
+        import yaml
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+        env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+        return {"success": True, "message": f"Provider {provider} configured (model={model or 'default'}, key={api_key[:4]}...{api_key[-4:]})"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _action_hermes_setup(data: dict) -> dict:
+    """Run 'hermes setup' or 'hermes model' in background."""
+    import subprocess
+    import sys
+    cmd = data.get("command", "model")  # "setup" or "model"
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hermes_cli.main", cmd],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(REPO_ROOT),
+            env={**os.environ, "HERMES_HOME": str(HERMES_HOME)},
+        )
+        # Wait briefly for output
+        import select
+        readable, _, _ = select.select([proc.stdout], [], [], 5)
+        output = ""
+        if readable:
+            output = proc.stdout.read(4096).decode("utf-8", errors="ignore")
+        return {"success": True, "output": output, "pid": proc.pid}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _action_test_key(data: dict) -> dict:
+    """Test an API key by making a simple chat request."""
+    provider = data.get("provider", "")
+    api_key = data.get("apiKey", "")
+    base_url = data.get("baseUrl", "")
+    model = data.get("model", "")
+    if not api_key or not base_url:
+        return {"success": False, "error": "apiKey and baseUrl required"}
+    try:
+        from urllib.request import Request, urlopen
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        body = json.dumps({
+            "model": model or "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "Hi, respond with just 'OK'"}],
+            "max_tokens": 5,
+        }).encode("utf-8")
+        req = Request(url, data=body, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }, method="POST")
+        with urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {"success": True, "message": f"Key works! Response: {content}", "model": result.get("model", "")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _action_remove_key(data: dict) -> dict:
+    """Remove API key from multi_provider.yaml."""
+    provider_id = data.get("providerId", "")
+    key_preview = data.get("keyPreview", "")
+    if not provider_id or not key_preview:
+        return {"success": False, "error": "providerId and keyPreview required"}
+    config_path = HERMES_HOME / "multi_provider.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        return {"success": False, "error": "No multi_provider.yaml found"}
+    providers = config.get("providers", {})
+    if provider_id not in providers:
+        return {"success": False, "error": f"Provider '{provider_id}' not found"}
+    keys = providers[provider_id].get("keys", [])
+    new_keys = []
+    for k in keys:
+        k_str = k.get("key", "") if isinstance(k, dict) else k
+        preview = k_str[:4] + "..." + k_str[-4:] if len(k_str) > 8 else "***"
+        if preview != key_preview:
+            new_keys.append(k)
+    providers[provider_id]["keys"] = new_keys
+    try:
+        import yaml
+        config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+        return {"success": True, "providers": _get_providers()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _action_toggle_key(data: dict) -> dict:
+    """Enable/disable an API key."""
+    provider_id = data.get("providerId", "")
+    key_preview = data.get("keyPreview", "")
+    if not provider_id or not key_preview:
+        return {"success": False, "error": "providerId and keyPreview required"}
+    config_path = HERMES_HOME / "multi_provider.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        return {"success": False, "error": "No multi_provider.yaml found"}
+    providers = config.get("providers", {})
+    if provider_id not in providers:
+        return {"success": False, "error": f"Provider '{provider_id}' not found"}
+    keys = providers[provider_id].get("keys", [])
+    for k in keys:
+        if not isinstance(k, dict):
+            continue
+        k_str = k.get("key", "")
+        preview = k_str[:4] + "..." + k_str[-4:] if len(k_str) > 8 else "***"
+        if preview == key_preview:
+            k["enabled"] = not k.get("enabled", True)
+            try:
+                import yaml
+                config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+                return {"success": True, "providers": _get_providers()}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+    return {"success": False, "error": "Key not found"}
 
 
 # ─── HTML (full control center) ─────────────────────────────────────────────
@@ -506,7 +650,31 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 </div>
 <div class="chat-input-row" style="margin-top:.2rem"><textarea id="ci" placeholder="Nhập tin nhắn..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea><button class="btn btn-p" onclick="send()">Gửi</button></div></div></div>
 <div id="overview" class="view"><div class="sg" id="sc"></div></div>
-<div id="providers" class="view"><div id="pl"></div><button class="btn btn-p" onclick="addP()">+ Provider</button></div>
+<div id="providers" class="view"><div id="pl"></div>
+<div class="card" style="margin-top:.5rem">
+<b>🔑 Setup API Key nhanh</b><br><br>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
+<select id="sp-provider" class="search" style="margin:0">
+<option value="">Chọn provider...</option>
+<option value="zai">GLM (z.ai) — FREE</option>
+<option value="openai">OpenAI</option>
+<option value="anthropic">Anthropic (Claude)</option>
+<option value="openrouter">OpenRouter</option>
+<option value="deepseek">DeepSeek</option>
+<option value="custom">Custom</option>
+</select>
+<input id="sp-model" class="search" style="margin:0" placeholder="Model (vd: glm-4.6)">
+<input id="sp-baseurl" class="search" style="margin:0" placeholder="Base URL (vd: https://open.bigmodel.cn/api/paas/v4)">
+<input id="sp-apikey" class="search" style="margin:0" type="password" placeholder="API Key">
+</div>
+<div style="display:flex;gap:.3rem;margin-top:.4rem">
+<button class="btn btn-p" onclick="setupProvider()">💾 Lưu config</button>
+<button class="btn btn-h" onclick="testKey()">🧪 Test key</button>
+</div>
+<div id="sp-result" style="font-size:.7rem;margin-top:.3rem;color:var(--dim)"></div>
+</div>
+<button class="btn btn-h" onclick="addP()" style="margin-top:.5rem">+ Thêm Provider (multi_provider.yaml)</button>
+</div>
 <div id="config" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fc(this.value)"><div id="cl"></div></div>
 <div id="skills" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fs(this.value)"><div id="sl" class="sk-grid"></div></div>
 <div id="costs" class="view"><div id="cs"></div></div>
@@ -543,6 +711,8 @@ async function rL(){const l=await api('logs');if(!l)return;document.getElementBy
 async function tc(p,el){const r=await post('toggle-config',{path:p});if(r&&r.success){el.classList.toggle('on');ref()}}
 function addK(pid){const k=prompt('Key:');if(!k)return;const q=prompt('Quota (0=∞):','0')||'0';post('add-key',{providerId:pid,key:k,quota:parseInt(q)}).then(r=>{if(r&&r.success)rP();else alert(r?r.error:'Fail')})}
 function addP(){const n=prompt('Name:');if(!n)return;const u=prompt('URL:');if(!u)return;const m=prompt('Models:');const k=prompt('Key:');post('add-provider',{name:n,baseUrl:u,models:m?m.split(','):[],key:k||'',quota:0}).then(r=>{if(r&&r.success)rP();else alert(r?r.error:'Fail')})}
+function setupProvider(){const p=document.getElementById('sp-provider').value,m=document.getElementById('sp-model').value,u=document.getElementById('sp-baseurl').value,k=document.getElementById('sp-apikey').value;if(!p||!k){document.getElementById('sp-result').innerHTML='❌ Chọn provider + nhập key';return}post('setup-provider',{provider:p,apiKey:k,model:m,baseUrl:u}).then(r=>{if(r&&r.success){document.getElementById('sp-result').innerHTML='✅ '+r.message;ref()}else document.getElementById('sp-result').innerHTML='❌ '+(r?r.error:'Fail')})}
+function testKey(){const p=document.getElementById('sp-provider').value,m=document.getElementById('sp-model').value,u=document.getElementById('sp-baseurl').value,k=document.getElementById('sp-apikey').value;if(!k||!u){document.getElementById('sp-result').innerHTML='❌ Nhập key + base URL';return}document.getElementById('sp-result').innerHTML='⏳ Đang test...';post('test-key',{provider:p,apiKey:k,baseUrl:u,model:m}).then(r=>{if(r&&r.success)document.getElementById('sp-result').innerHTML='✅ '+r.message;else document.getElementById('sp-result').innerHTML='❌ '+(r?r.error:'Fail')})}
 function fc(q){q=q.toLowerCase();document.querySelectorAll('.cf').forEach(f=>f.style.display=f.textContent.toLowerCase().includes(q)?'':'none')}
 function fs(q){q=q.toLowerCase();document.querySelectorAll('.skc').forEach(c=>c.style.display=c.textContent.toLowerCase().includes(q)?'':'none')}
 ca();ref();rP();rC();rS();rCost();rL();
@@ -585,9 +755,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/action/start-gateway": self._send_json(_start_gateway())
         elif path == "/api/action/chat": self._send_json(_send_to_agent(data.get("message", "")))
         elif path == "/api/action/add-key": self._send_json(_action_add_key(data))
+        elif path == "/api/action/remove-key": self._send_json(_action_remove_key(data))
+        elif path == "/api/action/toggle-key": self._send_json(_action_toggle_key(data))
         elif path == "/api/action/toggle-config": self._send_json(_action_toggle_config(data))
         elif path == "/api/action/add-provider": self._send_json(_action_add_provider(data))
         elif path == "/api/action/set-mode": self._send_json(_action_set_mode(data))
+        elif path == "/api/action/setup-provider": self._send_json(_action_setup_provider(data))
+        elif path == "/api/action/hermes-setup": self._send_json(_action_hermes_setup(data))
+        elif path == "/api/action/test-key": self._send_json(_action_test_key(data))
         elif path == "/api/action/run-eval":
             import subprocess, sys as _sys
             eval_script = REPO_ROOT / "scripts" / "evaluate_cognitive.py"
