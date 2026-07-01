@@ -163,9 +163,16 @@ clone_repo() {
     REPO_DIR="$HOME/hermes-omni"
     if [ -d "$REPO_DIR" ]; then
         warn "$REPO_DIR already exists."
-        read -rp "Pull latest? [Y/n] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        # Auto-pull if non-interactive (e.g., curl | bash), else prompt.
+        if [ -t 0 ]; then
+            read -rp "Pull latest? [Y/n] " -n 1 -r
+            echo
+            SHOULD_PULL=$([[ ! $REPLY =~ ^[Nn]$ ]] && echo yes || echo no)
+        else
+            info "Non-interactive mode — auto-pulling latest..."
+            SHOULD_PULL=yes
+        fi
+        if [ "$SHOULD_PULL" = "yes" ]; then
             cd "$REPO_DIR"
             git pull --ff-only origin main || warn "Pull failed, continuing with existing"
             cd -
@@ -221,9 +228,15 @@ install_extras() {
 
     echo "Embedding (semantic recall) improves memory quality +40%."
     echo "Requires sentence-transformers (~80MB model download)."
-    read -rp "Install sentence-transformers? [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [ -t 0 ]; then
+        read -rp "Install sentence-transformers? [y/N] " -n 1 -r
+        echo
+        INSTALL_EXTRA=$([[ $REPLY =~ ^[Yy]$ ]] && echo yes || echo no)
+    else
+        info "Non-interactive mode — skipping extras (install later: uv pip install sentence-transformers)"
+        INSTALL_EXTRA=no
+    fi
+    if [ "$INSTALL_EXTRA" = "yes" ]; then
         info "Installing sentence-transformers..."
         uv pip install sentence-transformers --quiet 2>&1 | tail -3
         success "sentence-transformers installed"
@@ -265,9 +278,15 @@ launch_setup() {
     echo "  • Configuring messaging platforms (Telegram, Discord, Slack, ...)"
     echo "  • Enabling tools (web search, image gen, TTS, ...)"
     echo ""
-    read -rp "Launch setup wizard now? [Y/n] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+    if [ -t 0 ]; then
+        read -rp "Launch setup wizard now? [Y/n] " -n 1 -r
+        echo
+        LAUNCH_SETUP=$([[ ! $REPLY =~ ^[Nn]$ ]] && echo yes || echo no)
+    else
+        info "Non-interactive mode — skipping setup wizard (run later: hermes setup)"
+        LAUNCH_SETUP=no
+    fi
+    if [ "$LAUNCH_SETUP" = "yes" ]; then
         hermes setup
     else
         info "You can run setup later: hermes setup"
