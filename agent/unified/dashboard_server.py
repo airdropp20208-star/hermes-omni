@@ -673,7 +673,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <button class="nav-btn" onclick="nv(event,'overview')" title="Tổng quan">📊</button>
 <button class="nav-btn" onclick="nv(event,'providers')" title="Nhà cung cấp API">🔌</button>
 <button class="nav-btn" onclick="nv(event,'config')" title="Cấu hình tính năng">⚙️</button>
-<button class="nav-btn" onclick="nv(event,'skills')" title="Thư viện kỹ năng">📚</button>
 <button class="nav-btn" onclick="nv(event,'costs')" title="Thống kê chi phí">💰</button>
 <button class="nav-btn" onclick="nv(event,'logs')" title="Nhật ký hoạt động">📋</button>
 <div class="nav-spacer"></div>
@@ -736,13 +735,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <button class="btn btn-h" onclick="addP()" style="margin-top:.5rem">+ Thêm nhà cung cấp (nhiều key)</button>
 </div>
 <div id="config" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fc(this.value)"><div id="cl"></div></div>
-<div id="skills" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fs(this.value)"><div id="sl" class="sk-grid"></div></div>
 <div id="costs" class="view"><div id="cs"></div></div>
 <div id="logs" class="view"><div class="card" style="max-height:400px;overflow:auto" id="lf"></div></div>
 
 </div></div>
 <script>
-const T={chat:'Trò chuyện',overview:'Tổng quan',providers:'Nhà cung cấp API',config:'Cấu hình',skills:'Kỹ năng',costs:'Chi phí',logs:'Nhật ký hoạt động'};
+const T={chat:'Trò chuyện',overview:'Tổng quan',providers:'Nhà cung cấp API',config:'Cấu hình',costs:'Chi phí',logs:'Nhật ký hoạt động'};
 let msgs=[],cnt=25;
 let curMode={thinking:'balanced',reasoning:'standard',verify:'on'};
 function setMode(type,val,btn){document.querySelectorAll('.mode-group').forEach(g=>{if(g.querySelector('.mode-label').textContent.toLowerCase().includes(type==='thinking'?'thinking':type==='reasoning'?'reasoning':'verify')){g.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'))}});btn.classList.add('active');curMode[type]=val;const info=document.getElementById('mode-info');info.textContent=curMode.thinking+' · '+curMode.reasoning+' · '+(curMode.verify==='on'?'verify':'no-verify');post('set-mode',curMode).then(r=>{if(r&&r.success)addM('sys','⚙️ '+type+' = '+val)})}
@@ -776,9 +774,9 @@ function testKey(){const p=document.getElementById('sp-provider').value,m=docume
 function fc(q){q=q.toLowerCase();document.querySelectorAll('.cf').forEach(f=>f.style.display=f.textContent.toLowerCase().includes(q)?'':'none')}
 function fs(q){q=q.toLowerCase();document.querySelectorAll('.skc').forEach(c=>c.style.display=c.textContent.toLowerCase().includes(q)?'':'none')}
 async function loadCurrentConfig(){const c=await api('current-config');if(!c)return;const el=document.getElementById('sp-result');if(c.provider){el.innerHTML='📋 Hiện tại: <b>'+c.provider+'</b> | Model: <b>'+c.model+'</b> | Key: '+(c.has_key?'<b>'+c.key_preview+'</b> ✅':'<b>chưa có</b> ❌');document.getElementById('sp-provider').value=c.provider;if(c.model)document.getElementById('sp-model').value=c.model;if(c.base_url)document.getElementById('sp-baseurl').value=c.base_url}else{el.innerHTML='⚠ Chưa cấu hình nhà cung cấp nào. Hãy chọn provider + nhập key.'}}
-ca();ref();rP();rC();rS();rCost();rL();loadCurrentConfig();
+ca();ref();rP();rC();rCost();rL();loadCurrentConfig();
 setInterval(ca,5000);setInterval(ref,10000);setInterval(rL,3000);
-setTimeout(startAgent,2000);
+// Auto-start: không cần — chat dùng hermes -m one-shot trực tiếp
 </script>
 </body></html>"""
 # ─── HTTP Server ────────────────────────────────────────────────────────────
