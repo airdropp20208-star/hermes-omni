@@ -353,6 +353,6 @@ def configure_guardian(
         llm_call=llm_call,
         reflexion_recall=reflexion_recall,
         cache_size=cache_size,
-        cache_ttl=cache_ttl_seconds,
+        cache_ttl_seconds=cache_ttl_seconds,
     )
     return _guardian
