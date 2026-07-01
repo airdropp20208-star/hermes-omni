@@ -349,6 +349,49 @@ def _action_add_provider(data: dict) -> dict:
     except Exception as e: return {"success": False, "error": str(e)}
 
 
+def _action_set_mode(data: dict) -> dict:
+    """Set thinking level + reasoning mode + verify on/off. Writes to config.yaml."""
+    thinking = data.get("thinking", "balanced")
+    reasoning = data.get("reasoning", "standard")
+    verify = data.get("verify", "on")
+    config_path = HERMES_HOME / "config.yaml"
+    config = _read_yaml(config_path) or {}
+    unified = config.setdefault("unified", {})
+    # Thinking level
+    st = unified.setdefault("slow_thinking", {})
+    if thinking == "fast":
+        st["enabled"] = False
+    else:
+        st["enabled"] = True
+        st["default_level"] = thinking
+    # Reasoning level
+    sr = unified.setdefault("reasoning", {})
+    if reasoning == "off":
+        sr["enabled"] = False
+    else:
+        sr["enabled"] = True
+        # "standard" = default, "high" = slow_thinking deep, "max" = slow_thinking max
+        if reasoning == "high":
+            st["enabled"] = True
+            st["default_level"] = "deep"
+        elif reasoning == "max":
+            st["enabled"] = True
+            st["default_level"] = "max"
+    # Verify
+    sv = unified.setdefault("verifier", {})
+    sv["enabled"] = verify == "on"
+    # Also toggle smart_guardian with verify
+    sg = unified.setdefault("smart_guardian", {})
+    sg["enabled"] = verify == "on"
+    try:
+        import yaml
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.dump(config, default_flow_style=False, allow_unicode=True), encoding="utf-8")
+        return {"success": True, "message": f"Mode set: thinking={thinking}, reasoning={reasoning}, verify={verify}", "config": _get_config()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ─── HTML (full control center) ─────────────────────────────────────────────
 
 
@@ -387,6 +430,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 .chat-input-row textarea:focus{outline:none;border-color:var(--accent)}
 .file-area{padding:.2rem;border:1px dashed var(--border);border-radius:7px;text-align:center;font-size:.65rem;color:var(--muted);cursor:pointer;margin-bottom:.3rem}
 .file-area:hover{border-color:var(--accent)}.file-list{font-size:.6rem;color:var(--dim);margin-top:.15rem}
+/* Mode selector */
+.mode-bar{display:flex;gap:.3rem;align-items:center;padding:.3rem 0;border-top:1px solid var(--border);margin-top:.3rem;flex-wrap:wrap}
+.mode-group{display:flex;align-items:center;gap:.2rem}
+.mode-label{font-size:.6rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+.mode-btn{padding:.2rem .5rem;border-radius:5px;font-size:.65rem;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--dim);transition:.15s}
+.mode-btn:hover{border-color:var(--accent);color:var(--text)}
+.mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.mode-divider{width:1px;height:16px;background:var(--border);margin:0 .2rem}
+.mode-info{font-size:.55rem;color:var(--muted);margin-left:auto}
 .sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:.6rem;margin-bottom:.8rem}
 .sc{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:.8rem}
 .sl{font-size:.6rem;text-transform:uppercase;color:var(--muted);font-weight:600}.sv{font-size:1.3rem;font-weight:800;margin:.15rem 0}.ss{font-size:.65rem;color:var(--dim)}
@@ -431,7 +483,28 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <button class="btn btn-h" onclick="startGW()" style="font-size:.6rem">Start GW</button></div></div>
 <div id="chat" class="chat-view active"><div class="chat-msgs" id="cm"><div class="msg sys">Chat với Hermes. Agent tự khởi động.</div></div>
 <div class="chat-bottom"><div class="file-area" id="fa" onclick="document.getElementById('fi').click()">📎 Kéo thả hoặc click<input type="file" id="fi" multiple style="display:none" onchange="upF(this.files)"></div><div class="file-list" id="fl"></div>
-<div class="chat-input-row" style="margin-top:.3rem"><textarea id="ci" placeholder="Nhập tin nhắn..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea><button class="btn btn-p" onclick="send()">Gửi</button></div></div></div>
+<div class="mode-bar">
+<div class="mode-group"><span class="mode-label">🧠 Thinking</span>
+<button class="mode-btn" onclick="setMode('thinking','fast',this)">Fast</button>
+<button class="mode-btn active" onclick="setMode('thinking','balanced',this)">Balanced</button>
+<button class="mode-btn" onclick="setMode('thinking','deep',this)">Deep</button>
+<button class="mode-btn" onclick="setMode('thinking','max',this)">Max</button>
+</div>
+<div class="mode-divider"></div>
+<div class="mode-group"><span class="mode-label">⚡ Reasoning</span>
+<button class="mode-btn" onclick="setMode('reasoning','off',this)">Off</button>
+<button class="mode-btn active" onclick="setMode('reasoning','standard',this)">Std</button>
+<button class="mode-btn" onclick="setMode('reasoning','high',this)">High</button>
+<button class="mode-btn" onclick="setMode('reasoning','max',this)">Max</button>
+</div>
+<div class="mode-divider"></div>
+<div class="mode-group"><span class="mode-label">🛡️ Verify</span>
+<button class="mode-btn" onclick="setMode('verify','off',this)">Off</button>
+<button class="mode-btn active" onclick="setMode('verify','on',this)">On</button>
+</div>
+<span class="mode-info" id="mode-info">balanced · std · verify</span>
+</div>
+<div class="chat-input-row" style="margin-top:.2rem"><textarea id="ci" placeholder="Nhập tin nhắn..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea><button class="btn btn-p" onclick="send()">Gửi</button></div></div></div>
 <div id="overview" class="view"><div class="sg" id="sc"></div></div>
 <div id="providers" class="view"><div id="pl"></div><button class="btn btn-p" onclick="addP()">+ Provider</button></div>
 <div id="config" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fc(this.value)"><div id="cl"></div></div>
@@ -443,6 +516,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <script>
 const T={chat:'Chat',overview:'Tổng quan',providers:'Provider',config:'Cấu hình',skills:'Kỹ năng',costs:'Chi phí',logs:'Nhật ký',json:'JSON Tool'};
 let msgs=[],cnt=25;
+let curMode={thinking:'balanced',reasoning:'standard',verify:'on'};
+function setMode(type,val,btn){document.querySelectorAll('.mode-group').forEach(g=>{if(g.querySelector('.mode-label').textContent.toLowerCase().includes(type==='thinking'?'thinking':type==='reasoning'?'reasoning':'verify')){g.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'))}});btn.classList.add('active');curMode[type]=val;const info=document.getElementById('mode-info');info.textContent=curMode.thinking+' · '+curMode.reasoning+' · '+(curMode.verify==='on'?'verify':'no-verify');post('set-mode',curMode).then(r=>{if(r&&r.success)addM('sys','⚙️ '+type+' = '+val)})}
 function nv(e,id){document.querySelectorAll('.view,.chat-view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));document.getElementById(id).classList.add('active');e.target.closest('.nav-btn').classList.add('active');document.getElementById('vt').textContent=T[id]}
 function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmtR(t){if(!t)return'';try{return'<pre>'+esc(JSON.stringify(JSON.parse(t),null,2))+'</pre>'}catch(e){return esc(t)}}
@@ -512,6 +587,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/action/add-key": self._send_json(_action_add_key(data))
         elif path == "/api/action/toggle-config": self._send_json(_action_toggle_config(data))
         elif path == "/api/action/add-provider": self._send_json(_action_add_provider(data))
+        elif path == "/api/action/set-mode": self._send_json(_action_set_mode(data))
         elif path == "/api/action/run-eval":
             import subprocess, sys as _sys
             eval_script = REPO_ROOT / "scripts" / "evaluate_cognitive.py"
