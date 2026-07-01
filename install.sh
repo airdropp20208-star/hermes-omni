@@ -186,40 +186,131 @@ clone_repo() {
 
 # ─── Create virtualenv + install deps ───────────────────────────────────────
 install_deps() {
-    header "4/7 — Creating virtualenv and installing dependencies"
+    header "4/7 — Installing dependencies"
 
     cd "$REPO_DIR"
 
-    info "Creating Python 3.11 virtualenv..."
-    if [ ! -d ".venv" ]; then
-        uv venv .venv --python 3.11
-        success "Virtualenv created"
+    if [ "$INSTALL_MODE" = "system" ]; then
+        # ─── System-wide install (no venv) ───────────────────────────
+        info "System-wide install (no virtualenv)..."
+        info "Installing dependencies via uv tool (this may take 2-5 minutes)..."
+        # uv tool install creates an isolated env internally but exposes
+        # the `hermes` command globally — user never sees/activates venv.
+        uv tool install -e ".[all,dev]" --force 2>&1 | tail -10
+        success "Dependencies installed (system-wide via uv tool)"
+
+        # Verify hermes command works
+        if command -v hermes &>/dev/null; then
+            success "hermes command available: $(which hermes)"
+        else
+            # Add uv tool bin to PATH
+            local uv_tool_dir
+            uv_tool_dir="$(uv tool dir)/bin"
+            export PATH="$uv_tool_dir:$PATH"
+            if command -v hermes &>/dev/null; then
+                success "hermes command available: $(which hermes)"
+                # Add to shell profile
+                case "$SHELL" in
+                    */bash) profile="$HOME/.bashrc" ;;
+                    */zsh)  profile="$HOME/.zshrc" ;;
+                    *)      profile="$HOME/.profile" ;;
+                esac
+                if [ -n "$profile" ] && [ -f "$profile" ]; then
+                    if ! grep -q "$uv_tool_dir" "$profile" 2>/dev/null; then
+                        echo "export PATH=\"$uv_tool_dir:\$PATH\"" >> "$profile"
+                        info "Added $uv_tool_dir to PATH in $profile"
+                    fi
+                fi
+            else
+                warn "hermes not yet in PATH. Run: source $profile || export PATH=\"$uv_tool_dir:\$PATH\""
+            fi
+        fi
     else
-        success "Virtualenv already exists"
+        # ─── Virtualenv install (default) ────────────────────────────
+        info "Creating Python 3.11 virtualenv..."
+        if [ ! -d ".venv" ]; then
+            uv venv .venv --python 3.11
+            success "Virtualenv created"
+        else
+            success "Virtualenv already exists"
+        fi
+
+        # Activate venv
+        case "$OS" in
+            windows)
+                # shellcheck disable=SC1091
+                source .venv/Scripts/activate
+                ;;
+            *)
+                # shellcheck disable=SC1091
+                source .venv/bin/activate
+                ;;
+        esac
+
+        info "Installing dependencies (this may take 2-5 minutes)..."
+        uv pip install -e ".[all,dev]" --quiet 2>&1 | tail -5
+        success "Dependencies installed"
+
+        # Create global symlink so `hermes` works without activating venv
+        install_global_symlink
+
+        # Verify hermes command works
+        if command -v hermes &>/dev/null; then
+            success "hermes command available: $(which hermes)"
+        else
+            warn "hermes not in PATH. Use: source .venv/bin/activate"
+        fi
+    fi
+}
+
+# ─── Global symlink (so `hermes` works without venv activation) ─────────────
+install_global_symlink() {
+    local venv_bin="$REPO_DIR/.venv/bin"
+    local hermes_bin="$venv_bin/hermes"
+    local hermes_agent_bin="$venv_bin/hermes-agent"
+    local target_dir=""
+
+    # Find writable bin dir in PATH
+    for dir in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+            target_dir="$dir"
+            break
+        fi
+    done
+
+    # Create ~/.local/bin if none found
+    if [ -z "$target_dir" ]; then
+        target_dir="$HOME/.local/bin"
+        mkdir -p "$target_dir"
     fi
 
-    # Activate venv
-    case "$OS" in
-        windows)
-            # shellcheck disable=SC1091
-            source .venv/Scripts/activate
-            ;;
-        *)
-            # shellcheck disable=SC1091
-            source .venv/bin/activate
-            ;;
+    # Symlink hermes + hermes-agent
+    if [ -f "$hermes_bin" ]; then
+        ln -sf "$hermes_bin" "$target_dir/hermes"
+        info "Linked hermes → $target_dir/hermes"
+    fi
+    if [ -f "$hermes_agent_bin" ]; then
+        ln -sf "$hermes_agent_bin" "$target_dir/hermes-agent"
+        info "Linked hermes-agent → $target_dir/hermes-agent"
+    fi
+
+    # Ensure target_dir is in PATH (add to shell profile)
+    case "$SHELL" in
+        */bash) profile="$HOME/.bashrc" ;;
+        */zsh)  profile="$HOME/.zshrc" ;;
+        */fish) profile="$HOME/.config/fish/config.fish" ;;
+        *)      profile="$HOME/.profile" ;;
     esac
 
-    info "Installing dependencies (this may take 2-5 minutes)..."
-    uv pip install -e ".[all,dev]" --quiet 2>&1 | tail -5
-    success "Dependencies installed"
-
-    # Verify hermes command works
-    if command -v hermes &>/dev/null; then
-        success "hermes command available: $(which hermes)"
-    else
-        warn "hermes not in PATH. Use: source .venv/bin/activate"
+    if [ -n "$profile" ] && [ -f "$profile" ]; then
+        if ! grep -q "$target_dir" "$profile" 2>/dev/null; then
+            echo "export PATH=\"$target_dir:\$PATH\"" >> "$profile"
+            info "Added $target_dir to PATH in $profile"
+        fi
     fi
+
+    # Export for current session
+    export PATH="$target_dir:$PATH"
 }
 
 # ─── Optional: sentence-transformers ────────────────────────────────────────
@@ -337,8 +428,48 @@ print_next_steps() {
     echo ""
 }
 
+# ─── Parse arguments ────────────────────────────────────────────────────────
+INSTALL_MODE="venv"  # default: venv | system
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --system|--no-venv)
+                INSTALL_MODE="system"
+                shift
+                ;;
+            --venv)
+                INSTALL_MODE="venv"
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: bash install.sh [--system|--no-venv|--venv]"
+                echo ""
+                echo "Options:"
+                echo "  --system, --no-venv  Install system-wide (no virtualenv). hermes command global."
+                echo "  --venv               Install in virtualenv (default). hermes in .venv."
+                echo "  -h, --help           Show this help."
+                exit 0
+                ;;
+            *)
+                warn "Unknown argument: $1"
+                shift
+                ;;
+        esac
+    done
+}
+
 # ─── Main ───────────────────────────────────────────────────────────────────
 main() {
+    parse_args "$@"
+
+    if [ "$INSTALL_MODE" = "system" ]; then
+        info "Install mode: SYSTEM-WIDE (no virtualenv)"
+    else
+        info "Install mode: VIRTUALENV (default)"
+    fi
+    echo ""
+
     check_prereqs
     install_uv
     clone_repo
