@@ -92,6 +92,27 @@ def _scan_skills() -> list[dict]:
     return skills
 
 
+def _get_current_config() -> dict:
+    """Read current provider/model config from config.yaml + .env."""
+    config = _read_yaml(HERMES_HOME / "config.yaml") or {}
+    model_cfg = config.get("model", {})
+    # Read .env for API key
+    env_path = HERMES_HOME / ".env"
+    api_key = ""
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "_API_KEY=" in line:
+                api_key = line.split("=", 1)[1].strip()
+                break
+    return {
+        "provider": model_cfg.get("provider", ""),
+        "model": model_cfg.get("default", ""),
+        "base_url": model_cfg.get("base_url", ""),
+        "has_key": bool(api_key),
+        "key_preview": (api_key[:4] + "..." + api_key[-4:]) if len(api_key) > 8 else ("***" if api_key else ""),
+    }
+
+
 def _get_status() -> dict:
     config = _read_yaml(HERMES_HOME / "config.yaml")
     unified = config.get("unified", {}) if config else {}
@@ -416,12 +437,24 @@ def _action_setup_provider(data: dict) -> dict:
     # Map provider to env var name (same as hermes_cli/auth.py)
     PROVIDER_ENV_KEYS = {
         "zai": "ZAI_API_KEY",
+        "xiaomi": "XIAOMI_API_KEY",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",
         "custom": "CUSTOM_API_KEY",
     }
+    PROVIDER_BASE_URLS = {
+        "zai": "https://open.bigmodel.cn/api/paas/v4",
+        "xiaomi": "https://api.xiaomimimo.com/v1",
+        "openai": "https://api.openai.com/v1",
+        "anthropic": "https://api.anthropic.com",
+        "openrouter": "https://openrouter.ai/api/v1",
+        "deepseek": "https://api.deepseek.com/v1",
+    }
+    # Auto-fill base_url if not provided
+    if not base_url and provider in PROVIDER_BASE_URLS:
+        base_url = PROVIDER_BASE_URLS[provider]
     key_var = PROVIDER_ENV_KEYS.get(provider, f"{provider.upper().replace('-', '_')}_API_KEY")
 
     # Save API key to .env
@@ -683,6 +716,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <select id="sp-provider" class="search" style="margin:0">
 <option value="">Chọn nhà cung cấp...</option>
 <option value="zai">GLM (z.ai) — Miễn phí</option>
+<option value="xiaomi">Xiaomi MiMo</option>
 <option value="openai">OpenAI (GPT)</option>
 <option value="anthropic">Anthropic (Claude)</option>
 <option value="openrouter">OpenRouter (nhiều model)</option>
@@ -741,7 +775,8 @@ function setupProvider(){const p=document.getElementById('sp-provider').value,m=
 function testKey(){const p=document.getElementById('sp-provider').value,m=document.getElementById('sp-model').value,u=document.getElementById('sp-baseurl').value,k=document.getElementById('sp-apikey').value;if(!k||!u){document.getElementById('sp-result').innerHTML='❌ Nhập key + base URL';return}document.getElementById('sp-result').innerHTML='⏳ Đang test...';post('test-key',{provider:p,apiKey:k,baseUrl:u,model:m}).then(r=>{if(r&&r.success)document.getElementById('sp-result').innerHTML='✅ '+r.message;else document.getElementById('sp-result').innerHTML='❌ '+(r?r.error:'Fail')})}
 function fc(q){q=q.toLowerCase();document.querySelectorAll('.cf').forEach(f=>f.style.display=f.textContent.toLowerCase().includes(q)?'':'none')}
 function fs(q){q=q.toLowerCase();document.querySelectorAll('.skc').forEach(c=>c.style.display=c.textContent.toLowerCase().includes(q)?'':'none')}
-ca();ref();rP();rC();rS();rCost();rL();
+async function loadCurrentConfig(){const c=await api('current-config');if(!c)return;const el=document.getElementById('sp-result');if(c.provider){el.innerHTML='📋 Hiện tại: <b>'+c.provider+'</b> | Model: <b>'+c.model+'</b> | Key: '+(c.has_key?'<b>'+c.key_preview+'</b> ✅':'<b>chưa có</b> ❌');document.getElementById('sp-provider').value=c.provider;if(c.model)document.getElementById('sp-model').value=c.model;if(c.base_url)document.getElementById('sp-baseurl').value=c.base_url}else{el.innerHTML='⚠ Chưa cấu hình nhà cung cấp nào. Hãy chọn provider + nhập key.'}}
+ca();ref();rP();rC();rS();rCost();rL();loadCurrentConfig();
 setInterval(ca,5000);setInterval(ref,10000);setInterval(rL,3000);
 setTimeout(startAgent,2000);
 </script>
@@ -760,6 +795,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/costs"): self._send_json(_get_costs())
         elif path.startswith("/api/logs"): self._send_json(_get_logs())
         elif path.startswith("/api/agent-status"): self._send_json({"running": _agent_process is not None and _agent_process.poll() is None, "pid": _agent_process.pid if _agent_process else None})
+        elif path.startswith("/api/current-config"): self._send_json(_get_current_config())
         elif path.startswith("/api/download/"): self._serve_file(path.replace("/api/download/", ""))
         else: self._send_json({"error": "not found"}, 404)
 
