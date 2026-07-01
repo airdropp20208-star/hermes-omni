@@ -490,8 +490,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(_get_costs())
         elif path.startswith("/api/logs"):
             self._send_json(_get_logs())
+        elif path.startswith("/api/forecast"):
+            self._send_json(_get_forecast())
+        elif path.startswith("/api/distillery"):
+            self._send_json(_get_distillery())
+        elif path.startswith("/api/hologram"):
+            self._send_json(_get_hologram())
+        elif path.startswith("/api/action/"):
+            self._send_json({"error": "Use POST for actions"}, 405)
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # Read body
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path == "/api/action/add-key":
+            result = _action_add_key(data)
+            self._send_json(result)
+        elif path == "/api/action/remove-key":
+            result = _action_remove_key(data)
+            self._send_json(result)
+        elif path == "/api/action/toggle-key":
+            result = _action_toggle_key(data)
+            self._send_json(result)
+        elif path == "/api/action/toggle-config":
+            result = _action_toggle_config(data)
+            self._send_json(result)
+        elif path == "/api/action/add-provider":
+            result = _action_add_provider(data)
+            self._send_json(result)
+        elif path == "/api/action/run-eval":
+            result = _action_run_eval()
+            self._send_json(result)
+        elif path == "/api/action/save-config":
+            result = _action_save_config(data)
+            self._send_json(result)
+        else:
+            self._send_json({"error": "unknown action"}, 404)
 
     def _send_html(self, html: str):
         body = html.encode("utf-8")
@@ -512,6 +556,299 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass  # suppress
+
+
+# ─── Action handlers (WRITE to real files) ──────────────────────────────────
+
+
+def _action_add_key(data: dict) -> dict:
+    """Add API key to multi_provider.yaml."""
+    provider_id = data.get("providerId", "")
+    key = data.get("key", "")
+    quota = int(data.get("quota", 0) or 0)
+    if not provider_id or not key:
+        return {"success": False, "error": "providerId and key required"}
+
+    home = _hermes_home()
+    config_path = home / "multi_provider.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        config = {"providers": {}, "strategy": "round-robin"}
+
+    providers = config.setdefault("providers", {})
+    if provider_id not in providers:
+        return {"success": False, "error": f"Provider '{provider_id}' not found. Add provider first."}
+
+    provider = providers[provider_id]
+    keys = provider.setdefault("keys", [])
+    # Check duplicate
+    for existing in keys:
+        existing_key = existing.get("key", "") if isinstance(existing, dict) else existing
+        if existing_key == key:
+            return {"success": False, "error": "Key already exists"}
+
+    new_key = {"key": key, "quota_tokens": quota} if quota else {"key": key}
+    keys.append(new_key)
+
+    try:
+        import yaml
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.dump(config, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return {"success": True, "message": f"Key added to {provider_id}", "providers": _get_providers()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _action_remove_key(data: dict) -> dict:
+    """Remove API key from multi_provider.yaml."""
+    provider_id = data.get("providerId", "")
+    key_preview = data.get("keyPreview", "")
+    if not provider_id or not key_preview:
+        return {"success": False, "error": "providerId and keyPreview required"}
+
+    home = _hermes_home()
+    config_path = home / "multi_provider.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        return {"success": False, "error": "No multi_provider.yaml found"}
+
+    providers = config.get("providers", {})
+    if provider_id not in providers:
+        return {"success": False, "error": f"Provider '{provider_id}' not found"}
+
+    keys = providers[provider_id].get("keys", [])
+    original_count = len(keys)
+    # Filter out matching key (match by preview prefix)
+    new_keys = []
+    for k in keys:
+        k_str = k.get("key", "") if isinstance(k, dict) else k
+        preview = k_str[:4] + "..." + k_str[-4:] if len(k_str) > 8 else "***"
+        if preview != key_preview:
+            new_keys.append(k)
+    providers[provider_id]["keys"] = new_keys
+
+    if len(new_keys) == original_count:
+        return {"success": False, "error": "Key not found"}
+
+    try:
+        import yaml
+        config_path.write_text(
+            yaml.dump(config, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return {"success": True, "message": "Key removed", "providers": _get_providers()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _action_toggle_key(data: dict) -> dict:
+    """Enable/disable an API key."""
+    provider_id = data.get("providerId", "")
+    key_preview = data.get("keyPreview", "")
+    if not provider_id or not key_preview:
+        return {"success": False, "error": "providerId and keyPreview required"}
+
+    home = _hermes_home()
+    config_path = home / "multi_provider.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        return {"success": False, "error": "No multi_provider.yaml found"}
+
+    providers = config.get("providers", {})
+    if provider_id not in providers:
+        return {"success": False, "error": f"Provider '{provider_id}' not found"}
+
+    keys = providers[provider_id].get("keys", [])
+    for k in keys:
+        if not isinstance(k, dict):
+            continue
+        k_str = k.get("key", "")
+        preview = k_str[:4] + "..." + k_str[-4:] if len(k_str) > 8 else "***"
+        if preview == key_preview:
+            k["enabled"] = not k.get("enabled", True)
+            try:
+                import yaml
+                config_path.write_text(
+                    yaml.dump(config, default_flow_style=False, allow_unicode=True),
+                    encoding="utf-8",
+                )
+                return {"success": True, "message": f"Key {'enabled' if k['enabled'] else 'disabled'}", "providers": _get_providers()}
+            except Exception as exc:
+                return {"success": False, "error": str(exc)}
+
+    return {"success": False, "error": "Key not found"}
+
+
+def _action_toggle_config(data: dict) -> dict:
+    """Toggle a cognitive feature on/off in config.yaml."""
+    path = data.get("path", "")
+    if not path:
+        return {"success": False, "error": "path required"}
+
+    home = _hermes_home()
+    config_path = home / "config.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        config = {}
+
+    # Parse path: "unified.reasoning.enabled" → config["unified"]["reasoning"]["enabled"]
+    parts = path.split(".")
+    if len(parts) < 3:
+        return {"success": False, "error": "Invalid path format"}
+
+    # Navigate to parent
+    current = config
+    for part in parts[:-1]:
+        if part not in current:
+            current[part] = {}
+        current = current[part]
+
+    # Toggle
+    key = parts[-1]
+    current[key] = not current.get(key, False)
+    new_value = current[key]
+
+    try:
+        import yaml
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.dump(config, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return {"success": True, "message": f"{path} = {new_value}", "config": _get_config()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _action_add_provider(data: dict) -> dict:
+    """Add a new provider to multi_provider.yaml."""
+    name = data.get("name", "")
+    base_url = data.get("baseUrl", "")
+    models = data.get("models", [])
+    key = data.get("key", "")
+    quota = int(data.get("quota", 0) or 0)
+
+    if not name or not base_url:
+        return {"success": False, "error": "name and baseUrl required"}
+
+    home = _hermes_home()
+    config_path = home / "multi_provider.yaml"
+    config = _read_yaml(config_path)
+    if not config:
+        config = {"providers": {}, "strategy": "round-robin"}
+
+    providers = config.setdefault("providers", {})
+    if name in providers:
+        return {"success": False, "error": f"Provider '{name}' already exists"}
+
+    provider_data = {
+        "base_url": base_url,
+        "enabled": True,
+        "models": models if isinstance(models, list) else [models],
+        "keys": [],
+    }
+    if key:
+        provider_data["keys"] = [{"key": key, "quota_tokens": quota}] if quota else [{"key": key}]
+
+    providers[name] = provider_data
+
+    try:
+        import yaml
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.dump(config, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return {"success": True, "message": f"Provider '{name}' added", "providers": _get_providers()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _action_run_eval() -> dict:
+    """Run evaluation script and return result."""
+    import subprocess
+    import sys
+    repo_root = _repo_root()
+    eval_script = repo_root / "scripts" / "evaluate_cognitive.py"
+    if not eval_script.exists():
+        return {"success": False, "error": "Evaluation script not found"}
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(eval_script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(repo_root),
+        )
+        return {
+            "success": result.returncode == 0,
+            "output": result.stdout[-2000:] if result.stdout else "",
+            "errors": result.stderr[-500:] if result.stderr else "",
+        }
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Evaluation timed out (60s)"}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _action_save_config(data: dict) -> dict:
+    """Save full config from dashboard to config.yaml."""
+    config_data = data.get("config", {})
+    if not config_data:
+        return {"success": False, "error": "No config data provided"}
+
+    home = _hermes_home()
+    config_path = home / "config.yaml"
+
+    try:
+        import yaml
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.dump(config_data, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return {"success": True, "message": "Config saved", "config": _get_config()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+# ─── Additional data getters for breakthrough modules ────────────────────────
+
+
+def _get_forecast() -> dict:
+    """Get failure forecast status."""
+    try:
+        from agent.unified.failure_forecast import forecast_now, forecast_stats
+        return {**forecast_now(), "stats": forecast_stats()}
+    except Exception:
+        return {"enabled": False, "risk_score": 0.0}
+
+
+def _get_distillery() -> dict:
+    """Get trajectory distillery stats."""
+    try:
+        from agent.unified.trajectory_distiller import distillery_stats
+        return distillery_stats()
+    except Exception:
+        return {"enabled": False}
+
+
+def _get_hologram() -> dict:
+    """Get context hologram for current project."""
+    try:
+        from agent.unified.context_hologram import get_hologram, hologram_stats
+        import os
+        hologram = get_hologram(os.getcwd(), force_refresh=False)
+        return {
+            "hologram": hologram[:2000] if hologram else "",
+            "stats": hologram_stats(),
+        }
+    except Exception:
+        return {"enabled": False, "hologram": ""}
 
 
 def run_server(port: int = 8788) -> None:
