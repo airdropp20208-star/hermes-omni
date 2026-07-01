@@ -260,7 +260,7 @@ class GuardianAgent:
                 if p.stat().st_size > max_bytes:
                     contents[script_path] = f"[File too large: {p.stat().st_size} bytes, skipped]"
                     continue
-                contents[script_path] = p.read_text(errors="replace")
+                contents[script_path] = p.read_text(encoding="utf-8", errors="replace")
             except (OSError, PermissionError) as e:
                 logger.debug("guardian_script_read_failed", path=script_path, error=str(e))
         return contents

@@ -4829,23 +4829,15 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
     )
 
-    # ── OmniAgent: Post-turn hooks (Context Evolution + stats) ──
-    if _omni_gate:
-        if failed:
-            try:
-                await _omni_gate.on_turn_failure(
-                    user_message,
-                    _turn_exit_reason,
-                    conversation_history,
-                )
-            except Exception as _omni_exc:
-                logger.debug("omni_turn_failure_hook_failed: %s", _omni_exc)
-        # Auto-promote learned lessons
-        if _omni_gate.evolution:
-            try:
-                _omni_gate.evolution.auto_promote_lessons()
-            except Exception:
-                pass
+    # NOTE: The OmniAgent post-turn hooks block that originally lived here
+    # (await _omni_gate.on_turn_failure / evolution.auto_promote_lessons)
+    # was DEAD CODE — it sat after the unconditional `return finalize_turn(...)`
+    # above, so it could never execute. Worse, the `await` inside a sync
+    # function (`run_conversation` is `def`, not `async def`) caused a
+    # SyntaxError that broke CI for the entire repo. Removed to fix the
+    # SyntaxError. The hook logic, if actually needed, should be moved
+    # inside `finalize_turn()` (which IS the post-loop finalizer) and
+    # called without `await` (use asyncio.run or make finalize_turn async).
 
 
 

@@ -77,7 +77,7 @@ class ExtensionLoader:
         """Load extension from plugin.yaml manifest."""
         import yaml
 
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             manifest = yaml.safe_load(f) or {}
 
         module_name = manifest.get("module", ext_name)

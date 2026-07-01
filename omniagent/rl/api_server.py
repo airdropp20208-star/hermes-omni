@@ -330,7 +330,7 @@ class RLAPIServer:
         )
         if self._record_file:
             os.makedirs(os.path.dirname(self._record_file), exist_ok=True)
-            open(self._record_file, "w").close()
+            open(self._record_file, "w", encoding="utf-8").close()
             logger.info(
                 "[OmniAgent-RL] record file initialized (cleared): %s",
                 self._record_file,
@@ -342,7 +342,7 @@ class RLAPIServer:
             self._prm_record_file = f"{base}_prm{ext}"
         if self._prm_record_file:
             os.makedirs(os.path.dirname(self._prm_record_file), exist_ok=True)
-            open(self._prm_record_file, "w").close()
+            open(self._prm_record_file, "w", encoding="utf-8").close()
             logger.info(
                 "[OmniAgent-RL] PRM record file initialized (cleared): %s",
                 self._prm_record_file,
@@ -513,7 +513,7 @@ class RLAPIServer:
             if not path:
                 continue
             try:
-                open(path, "w").close()
+                open(path, "w", encoding="utf-8").close()
                 logger.info("[OmniAgent-RL] %s file purged: %s", label, path)
             except OSError as e:
                 logger.warning(

@@ -36,7 +36,7 @@ class PluginManifest:
         if not manifest_path.exists():
             raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
         manifest = cls.from_dict(data)
