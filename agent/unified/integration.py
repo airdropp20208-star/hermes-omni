@@ -170,6 +170,18 @@ from .api_registry import (
     list_apis_by_category,
     search_apis,
 )
+# v3.3 Multi-Provider Gateway
+from .multi_provider import (
+    MultiProviderGateway,
+    configure_gateway,
+    get_gateway,
+    multi_provider_add,
+    multi_provider_add_key,
+    multi_provider_chat,
+    multi_provider_list,
+    multi_provider_stats,
+    run_server,
+)
 
 _bus = EventBus()
 _policy: PolicyEngine | None = None

@@ -195,6 +195,12 @@ class UnifiedConfig:
     # Agent can search/call APIs without memorizing URLs.
     api_registry_enabled: bool = True  # safe default — no LLM cost
     api_registry_auto_fetch: bool = False  # download full 1500+ catalog on first use
+    # --- v3.3 Multi-Provider Gateway ---
+    # Aggregate multiple LLM API keys into 1 endpoint. Round-robin +
+    # failover + quota tracking. Solves "many $2 accounts" problem.
+    multi_provider_enabled: bool = False
+    multi_provider_strategy: str = "round-robin"  # round-robin | least-used | failover-only
+    multi_provider_server_port: int = 8787
 
 
 _CONFIG_CACHE: UnifiedConfig | None = None
@@ -644,6 +650,20 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         _cfg_get("unified", "api_registry", "auto_fetch", default=False), default=False
     )
 
+    # --- v3.3 Multi-Provider Gateway config ---
+    multi_provider_enabled = _truthy(
+        _cfg_get("unified", "multi_provider", "enabled", default=False), default=False
+    )
+    multi_provider_strategy = str(
+        _cfg_get("unified", "multi_provider", "strategy", default="round-robin") or "round-robin"
+    )
+    try:
+        multi_provider_server_port = int(
+            _cfg_get("unified", "multi_provider", "server_port", default=8787) or 8787
+        )
+    except Exception:
+        multi_provider_server_port = 8787
+
     _CONFIG_CACHE = UnifiedConfig(
         enabled=enabled,
         reflexion_enabled=reflexion_enabled,
@@ -725,5 +745,8 @@ def load_unified_config(*, refresh: bool = False) -> UnifiedConfig:
         skill_registry_enabled=skill_registry_enabled,
         api_registry_enabled=api_registry_enabled,
         api_registry_auto_fetch=api_registry_auto_fetch,
+        multi_provider_enabled=multi_provider_enabled,
+        multi_provider_strategy=multi_provider_strategy,
+        multi_provider_server_port=multi_provider_server_port,
     )
     return _CONFIG_CACHE
