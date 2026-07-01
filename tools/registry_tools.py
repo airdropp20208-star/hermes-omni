@@ -73,25 +73,29 @@ def skill_search_tool(args: dict[str, Any], **_: Any) -> str:
 
 
 def skill_list_tool(args: dict[str, Any], **_: Any) -> str:
-    """List skills. Set installed=true to show only installed."""
+    """List skills with pagination."""
     installed_only = bool(args.get("installed", False))
+    category = args.get("category", "") or None
+    limit = int(args.get("limit", 20))
+    offset = int(args.get("offset", 0))
     if installed_only:
         skills = list_installed_skills()
+        total = len(skills)
+        skills = skills[offset : offset + limit]
     else:
-        skills = list_available_skills()
+        skills = list_available_skills(category=category, limit=limit, offset=offset)
+        # Get total count
+        all_skills = list_available_skills(category=category, limit=1000)
+        total = len(all_skills)
     return json.dumps(
         {
             "count": len(skills),
-            "installed_only": installed_only,
-            "skills": [
-                {
-                    "id": s["id"],
-                    "desc": s["desc"],
-                    "category": s["category"],
-                    "installed": s["installed"],
-                }
-                for s in skills
-            ],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + limit < total,
+            "next_offset": offset + limit if offset + limit < total else None,
+            "skills": skills,
         },
         ensure_ascii=False,
         indent=2,
@@ -278,11 +282,18 @@ _SKILL_SEARCH_SCHEMA = {
 
 _SKILL_LIST_SCHEMA = {
     "name": "skill_list",
-    "description": "List all available skills in the marketplace, or only installed skills.",
+    "description": (
+        "List available skills (paginated, 20 per page). "
+        "Returns compact format: id + short desc + category + installed status. "
+        "Use offset for next page. Use installed=true for only installed skills."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "installed": {"type": "boolean", "description": "If true, list only installed skills. Default: false (all)."},
+            "installed": {"type": "boolean", "description": "If true, list only installed skills. Default: false."},
+            "category": {"type": "string", "description": "Filter by category. Empty = all."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
         },
     },
 }

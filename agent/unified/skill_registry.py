@@ -877,19 +877,48 @@ def get_registry() -> SkillRegistry:
     return _registry
 
 
-def list_available_skills(*, category: str | None = None) -> list[dict[str, Any]]:
-    """Public API: list available skills from marketplace."""
-    return [e.to_dict() for e in get_registry().list_available(category=category)]
+def list_available_skills(*, category: str | None = None, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+    """Public API: list available skills. Returns compact format (id + desc only).
+
+    Pagination: use limit + offset to avoid loading all 113 skills at once.
+    Default: 20 skills per page.
+    """
+    all_skills = get_registry().list_available(category=category)
+    page = all_skills[offset : offset + limit]
+    return [
+        {
+            "id": s.id,
+            "desc": s.desc[:80],  # truncated
+            "category": s.category,
+            "installed": s.installed,
+        }
+        for s in page
+    ]
 
 
 def list_installed_skills() -> list[dict[str, Any]]:
-    """Public API: list installed (cached) skills."""
-    return [e.to_dict() for e in get_registry().list_installed()]
+    """Public API: list installed (cached) skills. Compact format."""
+    return [
+        {
+            "id": e.id,
+            "desc": e.desc[:80],
+            "category": e.category,
+        }
+        for e in get_registry().list_installed()
+    ]
 
 
-def search_skills(query: str) -> list[dict[str, Any]]:
-    """Public API: search skills by query."""
-    return [e.to_dict() for e in get_registry().search(query)]
+def search_skills(query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    """Public API: search skills by query. Returns compact format, max 10 results."""
+    return [
+        {
+            "id": e.id,
+            "desc": e.desc[:80],
+            "category": e.category,
+            "installed": e.installed,
+        }
+        for e in get_registry().search(query)[:limit]
+    ]
 
 
 def install_skill(skill_id: str, *, force: bool = False) -> dict[str, Any]:
