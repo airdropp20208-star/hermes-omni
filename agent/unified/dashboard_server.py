@@ -145,9 +145,12 @@ def _read_yaml(path: Path) -> dict:
 
 
 def _write_yaml(path: Path, data: dict) -> None:
+    """Atomic write: write to .tmp then rename (prevents corruption on crash)."""
     import yaml
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp.replace(path)  # atomic on POSIX
 
 
 def _read_jsonl(path: Path, limit: int = 1000) -> list:
@@ -408,9 +411,15 @@ def _get_costs() -> list:
 
 
 def _get_logs() -> list:
-    log_path = HERMES_HOME / "agent.log"
+    # Try multiple log locations (new: logs/agent.log, old: agent.log)
+    log_paths = [HERMES_HOME / "logs" / "agent.log", HERMES_HOME / "agent.log"]
+    log_path = None
+    for p in log_paths:
+        if p.exists():
+            log_path = p
+            break
     logs = []
-    if log_path.exists():
+    if log_path and log_path.exists():
         try:
             lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
             for line in reversed(lines[-300:]):
@@ -495,6 +504,7 @@ def _send_to_agent(message: str, timeout: int = 90) -> dict:
                 timeout=timeout,
                 cwd=str(REPO_ROOT),
                 env=env,
+                start_new_session=True,  # new process group → kill cleanup works
             )
             elapsed = time.time() - start
             response = (proc.stdout or "").strip()
@@ -517,6 +527,12 @@ def _send_to_agent(message: str, timeout: int = 90) -> dict:
         except subprocess.TimeoutExpired:
             elapsed = time.time() - start
             print(f"[chat] TIMEOUT after {elapsed:.1f}s", flush=True)
+            # Kill entire process group to avoid zombie subprocesses
+            try:
+                import signal as _sig
+                os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)  # type: ignore
+            except Exception:
+                pass
             return {"success": False, "error": f"Agent timeout sau {int(elapsed)}s — thử lại với câu ngắn hơn hoặc tắt tools (mode Fast)."}
         except Exception as exc:
             tb = traceback.format_exc()
@@ -563,7 +579,14 @@ def _action_setup_provider(data: dict) -> dict:
     if model:
         env_lines.append(f"HERMES_INFERENCE_MODEL={model}")
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    # Atomic + chmod 0600 (only owner can read API keys)
+    tmp = env_path.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+    tmp.replace(env_path)
+    try:
+        env_path.chmod(0o600)
+    except Exception:
+        pass
 
     # Also push to env so chat works without server restart
     os.environ[key_var] = api_key
@@ -1204,7 +1227,7 @@ document.querySelectorAll('.nav-btn[data-view]').forEach(btn => {
 });
 
 // ─── Helpers ───
-function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function fmtR(t){
   if(!t) return '';
   t = String(t);
@@ -1213,12 +1236,20 @@ function fmtR(t){
   if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
     try { return '<pre>'+esc(JSON.stringify(JSON.parse(trimmed),null,2))+'</pre>'; } catch(e) {}
   }
-  // Markdown-ish: code blocks
+  // Markdown-ish: code blocks with proper parsing
   if (t.includes('```')) {
-    return t.split(/```(\w*)/).slice(1).reduce((acc, part, i) => {
-      if (i % 2 === 0) return acc + '<pre>';
-      return acc + esc(part) + '</pre>';
-    }, esc(t.split('```')[0]));
+    const parts = t.split('```');
+    let html = esc(parts[0]);
+    for (let i = 1; i < parts.length; i += 2) {
+      // parts[i] is code (may have lang prefix on first line), parts[i+1] is text after
+      const codePart = parts[i] || '';
+      const textAfter = parts[i+1] || '';
+      // Strip optional lang identifier from first line
+      const code = codePart.replace(/^\w*\n/, '');
+      html += '<pre>' + esc(code.replace(/\n$/, '')) + '</pre>';
+      html += esc(textAfter);
+    }
+    return html.replace(/`([^`]+)`/g, '<code>$1</code>');
   }
   return esc(t).replace(/`([^`]+)`/g, '<code>$1</code>');
 }
@@ -1260,16 +1291,34 @@ function hideLogin(){
 async function doLogin(){
   const t = document.getElementById('loginToken').value.trim();
   if (!t) return;
-  localStorage.setItem('hermes_token', t);
-  // Test token by calling /api/health
-  const r = await fetch('/api/health', {headers: _authHeaders()});
-  if (r.ok) {
-    hideLogin();
-    location.reload();
-  } else {
-    document.getElementById('loginError').textContent = '❌ Token không đúng';
-    document.getElementById('loginError').style.display = 'block';
+  const btn = document.querySelector('.login-btn');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ Đang kiểm tra...';
+  const errEl = document.getElementById('loginError');
+  errEl.style.display = 'none';
+  try {
+    localStorage.setItem('hermes_token', t);
+    const r = await fetch('/api/health', {headers: _authHeaders()});
+    if (r.ok) {
+      hideLogin();
+      location.reload();
+    } else if (r.status === 401) {
+      errEl.textContent = '❌ Token không đúng';
+      errEl.style.display = 'block';
+      localStorage.removeItem('hermes_token');
+    } else {
+      errEl.textContent = '❌ Lỗi server (HTTP ' + r.status + ')';
+      errEl.style.display = 'block';
+      localStorage.removeItem('hermes_token');
+    }
+  } catch(e) {
+    errEl.textContent = '❌ Không kết nối được server: ' + e.message;
+    errEl.style.display = 'block';
     localStorage.removeItem('hermes_token');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
   }
 }
 function logout(){
@@ -1303,28 +1352,38 @@ async function send(){
   i.value = '';
   i.style.height = 'auto';
   sending = true;
-  document.getElementById('sendBtn').disabled = true;
-  document.getElementById('sendBtn').textContent = '⏳...';
+  const sendBtn = document.getElementById('sendBtn');
+  sendBtn.disabled = true;
+  sendBtn.textContent = '⏳...';
   addM('user', m);
   addM('sys', '⏳ Đang suy nghĩ...');
-  const r = await post('chat', {message:m});
-  // remove the "thinking..." message
-  const last = msgs[msgs.length-1];
-  if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
-  if (r && r.success) {
-    addM('agent', r.response || '(Không có phản hồi)');
-    if (r.warning) addM('sys', '⚠ '+r.warning);
-  } else {
-    const err = r ? (r.error || 'Không có phản hồi') : 'Không có phản hồi';
-    addM('error', '❌ ' + err);
-    if (err.includes('key') || err.includes('provider') || err.includes('API') || err.includes('No module')) {
-      addM('sys', '💡 Vào tab "Nhà cung cấp API" để cấu hình key');
+  try {
+    const r = await post('chat', {message:m});
+    // remove the "thinking..." message
+    const last = msgs[msgs.length-1];
+    if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
+    if (r && r.success) {
+      addM('agent', r.response || '(Không có phản hồi)');
+      if (r.warning) addM('sys', '⚠ '+r.warning);
+      if (r.elapsed) addM('sys', '⏱ ' + r.elapsed + 's');
+    } else {
+      const err = r ? (r.error || 'Không có phản hồi') : 'Không có phản hồi';
+      addM('error', '❌ ' + esc(err));
+      if (err.includes('key') || err.includes('provider') || err.includes('API') || err.includes('No module')) {
+        addM('sys', '💡 Vào tab "Nhà cung cấp API" để cấu hình key');
+      }
     }
+  } catch(e) {
+    // Network error mid-chat
+    const last = msgs[msgs.length-1];
+    if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
+    addM('error', '❌ Lỗi kết nối: ' + esc(e.message));
+  } finally {
+    sending = false;
+    sendBtn.disabled = false;
+    sendBtn.textContent = 'Gửi ➤';
+    loadOverview();
   }
-  sending = false;
-  document.getElementById('sendBtn').disabled = false;
-  document.getElementById('sendBtn').textContent = 'Gửi ➤';
-  loadOverview();
 }
 
 document.getElementById('sendBtn').addEventListener('click', send);
@@ -1357,16 +1416,18 @@ async function uploadFiles(fs){
     const fd = new FormData();
     fd.append('file', f);
     try {
-      const r = await fetch('/api/upload', {method:'POST', body:fd});
+      // FIX: include auth header (otherwise 401)
+      const r = await fetch('/api/upload', {method:'POST', headers: _authHeaders(), body: fd});
+      if (r.status === 401) { showLogin(); return; }
       const res = await r.json();
       if (res.success) {
         fl.innerHTML += '✓ '+esc(f.name)+'<br>';
-        addM('sys', '📎 Đã tải lên: '+f.name);
+        addM('sys', '📎 Đã tải lên: ' + esc(f.name));
       } else {
-        fl.innerHTML += '❌ '+esc(f.name)+': '+(res.error||'?')+'<br>';
+        fl.innerHTML += '❌ '+esc(f.name)+': '+esc(res.error||'?')+'<br>';
       }
     } catch(e) {
-      fl.innerHTML += '❌ '+esc(f.name)+': '+e.message+'<br>';
+      fl.innerHTML += '❌ '+esc(f.name)+': '+esc(e.message)+'<br>';
     }
   }
 }
@@ -1649,13 +1710,48 @@ async function init() {
       showLogin();
       return;
     }
+    if (!r.ok) {
+      // Server error — show login with message
+      document.getElementById('loginError').textContent = '⚠ Server lỗi (HTTP ' + r.status + '). Thử lại sau.';
+      document.getElementById('loginError').style.display = 'block';
+      showLogin();
+      return;
+    }
   } catch(e) {
-    // Server might be down — show login anyway
+    // Network error — server might be down
+    document.getElementById('loginError').textContent = '⚠ Không kết nối được server. Kiểm tra dashboard đang chạy?';
+    document.getElementById('loginError').style.display = 'block';
     showLogin();
     return;
   }
-  // Token OK — load dashboard
+  // Token OK — load dashboard + saved mode
   loadOverview();
+  loadSavedMode();
+}
+// Load saved mode from server config so UI matches what's in config.yaml
+async function loadSavedMode(){
+  try {
+    const cfg = await api('config');
+    if (!cfg) return;
+    const find = (k) => cfg.find(c => c.key === k);
+    const st = find('slow_thinking');
+    const rs = find('reasoning');
+    const vr = find('verifier');
+    // Map config → mode buttons
+    if (st && st.enabled) {
+      curMode.thinking = 'balanced'; // default; can't read level from config endpoint
+    } else {
+      curMode.thinking = 'fast';
+    }
+    if (rs) curMode.reasoning = rs.enabled ? 'standard' : 'off';
+    if (vr) curMode.verify = vr.enabled ? 'on' : 'off';
+    // Update UI
+    document.querySelectorAll('.mode-btn[data-mt]').forEach(btn => {
+      const mt = btn.dataset.mt, mv = btn.dataset.mv;
+      if (curMode[mt] === mv) btn.classList.add('active');
+      else btn.classList.remove('active');
+    });
+  } catch(e) {}
 }
 init();
 // Auto-refresh only when NOT on chat tab (chat can take 30-60s, don't interrupt)
@@ -1682,11 +1778,10 @@ setInterval(() => {
 # ─── HTTP handler ───────────────────────────────────────────────────────────
 
 class _StableHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer with daemon threads + shorter timeouts so
-    abandoned connections don't pile up and crash the server."""
+    """ThreadingHTTPServer with daemon threads + larger queue for browser bursts."""
     daemon_threads = True
     allow_reuse_address = True
-    request_queue_size = 8  # reject if too many queued
+    request_queue_size = 64  # browsers open 6+ parallel connections
 
 
 # ─── Security: auth token + rate limit + host guard ─────────────────────────
@@ -1696,7 +1791,7 @@ import secrets
 
 _AUTH_TOKEN_FILE = HERMES_HOME / ".dashboard_token"
 _RATE_LIMIT_WINDOW = 60  # seconds
-_RATE_LIMIT_MAX = 120  # requests per window per IP
+_RATE_LIMIT_MAX = 300  # requests per window per IP (browsers send 6+ parallel)
 _rate_log: dict = {}  # ip -> [timestamps]
 
 
@@ -1974,8 +2069,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 pass
 
     def _serve_file(self, filename: str):
-        fp = UPLOAD_DIR / filename
-        if not fp.exists():
+        # Security: prevent path traversal (.., absolute paths, symlinks)
+        safe_name = "".join(c for c in filename if c.isalnum() or c in "._-")
+        if not safe_name or safe_name != filename:
+            self._send_json({"error": "Invalid filename"}, 400)
+            return
+        fp = (UPLOAD_DIR / safe_name).resolve()
+        upload_resolved = UPLOAD_DIR.resolve()
+        # Ensure fp is inside UPLOAD_DIR (no traversal)
+        try:
+            fp.relative_to(upload_resolved)
+        except ValueError:
+            self._send_json({"error": "Path traversal blocked"}, 403)
+            return
+        if not fp.exists() or not fp.is_file():
             self._send_json({"error": "File not found"}, 404)
             return
         try:
