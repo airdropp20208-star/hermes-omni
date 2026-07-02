@@ -1,259 +1,440 @@
-<p align="center">
-  <img src="assets/banner.png" alt="Hermes Agent" width="100%">
-</p>
+<div align="center">
 
-# Hermes Agent ☤
-<p align="center">
-  <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
-</p>
-<p align="center">
-  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
-  <a href="README.ur-pk.md"><img src="https://img.shields.io/badge/Lang-اردو-green?style=for-the-badge" alt="اردو"></a>
-  <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
-</p>
+# ⚡ Hermes-Omni
 
-**The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+### Agent AI tự cải tiến — fork của Hermes v0.17.0
 
-Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [NovitaAI](https://novita.ai) (AI-native cloud for Model API, Agent Sandbox, and GPU Cloud), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
+[![Dashboard](https://img.shields.io/badge/Dashboard-v6-c8860d?style=for-the-badge)](#-dashboard)
+[![Modules](https://img.shields.io/badge/Modules-44-blueviolet?style=for-the-badge)](#-modules)
+[![Security](https://img.shields.io/badge/Security-Auth%20%2B%20Rate%20Limit-green?style=for-the-badge)](#-bảo-mật)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-<table>
-<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
-<tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
-<tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
-<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
-<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Singularity, Modal, and Daytona. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
-<tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
-</table>
+**44 modules reasoning · Dashboard web full-featured · Chạy trên UserLAnd/Termux/Linux**
+
+</div>
 
 ---
 
-## Quick Install
+## 📑 Mục lục
 
-### Linux, macOS, WSL2, Termux
+- [✨ Tính năng](#-tính-năng)
+- [🚀 Cài đặt nhanh](#-cài-đặt-nhanh)
+- [🖥️ Dashboard](#️-dashboard)
+- [🧠 Modules](#-modules)
+- [🔒 Bảo mật](#-bảo-mật)
+- [⚙️ Cấu hình](#️-cấu-hình)
+- [📱 Chạy trên UserLAnd](#-chạy-trên-userland)
+- [🔧 Khắc phục sự cố](#-khắc-phục-sự-cố)
+
+---
+
+## ✨ Tính năng
+
+Hermes-Omni biến Hermes Agent thành agent reasoning-first sánh ngang Claude/GLM, với:
+
+| Tính năng | Mô tả |
+|-----------|-------|
+| 🧠 **Reasoning pipeline** | Lập kế hoạch → đánh giá → thực hiện → rút kinh nghiệm |
+| 🛡️ **Smart Guardian** | LLM đánh giá output trước khi gửi |
+| 🔍 **Verifier** | Tự kiểm tra tính chính xác |
+| 📜 **Constitution** | Nguyên tắc đạo đức tích hợp |
+| 🐢 **Slow Thinking** | 4 mức suy luận: Fast / Balanced / Deep / Max |
+| 🎯 **Cognitive Tree** | Cây suy nghĩ phân nhánh |
+| 🔬 **Hypothesis** | Đặt giả thuyết + kiểm chứng |
+| 🧬 **Causal Graph** | Đồ thị nhân quả |
+| 📚 **Skill Registry** | 113 kỹ năng từ 10 repo (anthropics, claude...)
+| 🔌 **API Registry** | 1500+ API công khai
+| 💰 **Cost Tracker** | Đếm token + ngân sách
+| 🗄️ **Response Cache** | Lưu cache tiết kiệm token
+| 👤 **User Model** | Cá nhân hóa theo người dùng
+| ❓ **Clarifier** | Phát hiện câu hỏi mơ hồ → hỏi lại
+| 🔄 **Reflexion** | Học từ lỗi sai
+| 📈 **Learning** | Đường cong quên (Ebbinghaus)
+| 🛠️ **Skill Synthesizer** | Tự tạo kỹ năng mới
+| 📋 **Task Planner** | Chia task phức tạp thành subtask
+
+---
+
+## 🚀 Cài đặt nhanh
+
+### Yêu cầu
+
+- Python 3.11+
+- ~200MB disk space
+- API key từ bất kỳ provider nào (GLM, OpenAI, Xiaomi MiMo...)
+
+### Cài đặt
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+# Clone repo
+git clone https://github.com/airdropp20208-star/hermes-omni.git
+cd hermes-omni
+
+# Cài deps
+pip install -e .
+pip install pyyaml openai httpx requests
+
+# Khởi động dashboard
+./start.sh
 ```
 
-### Windows (native, PowerShell)
-
-> **Heads up:** Native Windows runs Hermes without WSL — CLI, gateway, TUI, and tools all work natively. If you'd rather use WSL2, the Linux/macOS one-liner above works there too. Found a bug? Please [file issues](https://github.com/NousResearch/hermes-agent/issues).
-
-Run this in PowerShell:
-
-```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
-```
-
-The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **and a portable Git Bash** (MinGit, unpacked to `%LOCALAPPDATA%\hermes\git` — no admin required, completely isolated from any system Git install). Hermes uses this bundled Git Bash to run shell commands.
-
-If you already have Git installed, the installer detects it and uses that instead. Otherwise a ~45MB MinGit download is all you need — it won't touch or interfere with any system Git.
-
-> **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
->
-> **Windows:** Native Windows is fully supported — the PowerShell one-liner above installs everything. If you'd rather use WSL2, the Linux command works there too. Native Windows install lives under `%LOCALAPPDATA%\hermes`; WSL2 installs under `~/.hermes` as on Linux.
-
-After installation:
+Hoặc chạy trực tiếp:
 
 ```bash
-source ~/.bashrc    # reload shell (or: source ~/.zshrc)
-hermes              # start chatting!
+python -m agent.unified.dashboard_server --port 8788
 ```
 
-### Troubleshooting
-
-#### Windows Defender or antivirus flags `uv.exe` as malware
-
-If your antivirus (Bitdefender, Windows Defender, etc.) quarantines `uv.exe` from the Hermes `bin` folder (`%LOCALAPPDATA%\hermes\bin\uv.exe`), this is a **false positive**. The file is Astral's `uv` — the Rust Python package manager Hermes bundles to manage its Python environment. ML-based antivirus engines commonly flag unsigned Rust binaries that download and install packages.
-
-**To verify your copy is authentic:**
-
-```powershell
-# Install GitHub CLI if needed
-winget install --id GitHub.cli
-
-# Login to GitHub
-gh auth login
-
-# Run verification
-$uv = "$env:LOCALAPPDATA\hermes\bin\uv.exe"
-$ver = (& $uv --version).Split(' ')[1]
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$zip = "$env:TEMP\uv.zip"
-Invoke-WebRequest "https://github.com/astral-sh/uv/releases/download/$ver/uv-x86_64-pc-windows-msvc.zip" -OutFile $zip -UseBasicParsing
-gh attestation verify $zip --repo astral-sh/uv
-Expand-Archive $zip "$env:TEMP\uv_x" -Force
-(Get-FileHash "$env:TEMP\uv_x\uv.exe").Hash -eq (Get-FileHash $uv).Hash
-```
-
-If attestation says "Verification succeeded" and the last line prints `True`, you're good.
-
-**To whitelist Hermes:**
-- **Windows Defender:** Run PowerShell as Admin → `Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\hermes\bin"`
-- **Bitdefender:** Add an exception in the Bitdefender console (Protection > Antivirus > Settings > Manage Exceptions)
-- Whitelist the **folder**, not the file hash — Hermes updates `uv` and the hash changes every version
-
-For more context, see the upstream Astral reports: [astral-sh/uv#13553](https://github.com/astral-sh/uv/issues/13553), [astral-sh/uv#15011](https://github.com/astral-sh/uv/issues/15011), [astral-sh/uv#10079](https://github.com/astral-sh/uv/issues/10079).
+Server in ra **token auth** trong terminal. Mở `http://localhost:8788`, nhập token để đăng nhập.
 
 ---
 
-## Getting Started
+## 🖥️ Dashboard
+
+Dashboard web full-featured với 7 tabs:
+
+### 💬 Trò chuyện
+- Chat realtime với agent
+- Mode panel: Thinking + Reasoning + Verify
+- Hiển thị thời gian xử lý
+- Hỗ trợ kéo thả file
+- Auto-refresh khi không chat
+
+### 📊 Tổng quan
+- Provider hiện tại + API key status
+- Số skills đã cài
+- Features đã bật (17/21)
+- Token usage
+
+### 🔌 Nhà cung cấp API
+- Form setup 10 providers (GLM, OpenAI, Anthropic, OpenRouter...)
+- Test key trực tiếp
+- Multi-provider: add/remove/toggle key
+- Sync `config.yaml` + `.env`
+
+### ⚙️ Cấu hình
+- 21 features toggle on/off
+- Atomic write (không corrupt khi crash)
+- Search filter
+
+### 📚 Kỹ năng
+- 113 skills từ 10 repos
+- Search filter
+- Auto-discovery
+
+### 💰 Chi phí
+- Token usage theo phase
+- Bar chart trực quan
+- Call count
+
+### 📋 Nhật ký
+- Activity log realtime
+- Multiple log paths
+- Auto-refresh 8s
+
+---
+
+## 🧠 Modules
+
+44 modules trong `agent/unified/`:
+
+### Nền tảng (v1)
+```
+reasoning.py          — Pipeline lập kế hoạch → đánh giá → thực hiện
+reflexion.py          — Học từ lỗi sai
+smart_guardian.py     — LLM đánh giá output
+policy.py             — Chính sách an toàn
+decision.py           — Ra quyết định
+```
+
+### Suy luận sâu (v2-v4)
+```
+cognitive_tree.py     — Cây suy nghĩ
+hypothesis.py         — Giả thuyết + kiểm chứng
+metacognitive.py      — Siêu nhận thức
+causal_graph.py       — Đồ thị nhân quả
+slow_thinking.py      — 4 mức suy luận
+context_distiller.py  — Chưng cất context
+context_hologram.py   — Hologram context
+failure_forecast.py   — Dự báo lỗi
+trajectory_distiller.py — Chưng cất quỹ đạo
+skill_evolution.py    — Tiến hóa kỹ năng
+persona_split.py      — Multi-persona
+harness.py            — Test harness
+```
+
+### Hạ tầng (v3)
+```
+cost_tracker.py       — Đếm token
+response_cache.py     — Cache response
+streaming.py          — Streaming output
+embedding.py          — Embedding cho memory
+multi_provider.py     — Gộp nhiều API key
+tool_router.py        — Tự chọn tool
+longrun.py            — Tác vụ nền
+```
+
+### Thư viện (v3.2)
+```
+skill_registry.py     — 113 skills
+api_registry.py       — 1500+ APIs
+capability_resolver.py — Auto-install tools
+```
+
+### Học tập (v2.1-v3.1)
+```
+learning.py           — Đường cong quên
+skill_synthesizer.py  — Tự tạo skill
+user_model.py         — Model người dùng
+clarifier.py          — Hỏi lại khi mơ hồ
+task_planner.py       — Chia task
+output_formatter.py   — Format Telegram/Slack
+```
+
+### Tích hợp
+```
+config.py             — Quản lý config
+integration.py        — Wire modules
+runtime_wiring.py     — 7 hooks vào mega-files
+dashboard_server.py   — Web dashboard v6
+```
+
+---
+
+## 🔒 Bảo mật
+
+Dashboard v6 có bảo mật đầy đủ:
+
+| Tính năng | Chi tiết |
+|-----------|----------|
+| 🔐 **Auth token** | Random 32 chars, lưu `~/.hermes/.dashboard_token` (chmod 600) |
+| 🏠 **Bind localhost** | Mặc định `127.0.0.1` — không ai cùng WiFi truy cập được |
+| 🚫 **DNS-rebinding guard** | Chỉ accept Host: localhost/127.0.0.1/::1 |
+| ⏱️ **Rate limit** | 300 req/phút/IP (429 nếu exceed) |
+| 📦 **Body limit** | 10MB max per request |
+| 🛡️ **Path traversal** | `/api/download/` sanitize filename + resolve check |
+| 🔑 **.env protection** | chmod 0600, atomic write |
+| ✍️ **Atomic YAML** | Write `.tmp` + rename (không corrupt khi crash) |
+
+### Truy cập từ máy khác (an toàn)
 
 ```bash
-hermes              # Interactive CLI — start a conversation
-hermes model        # Choose your LLM provider and model
-hermes tools        # Configure which tools are enabled
-hermes config set   # Set individual config values
-hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
-hermes setup        # Run the full setup wizard (configures everything at once)
-hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
-hermes update       # Update to the latest version
-hermes doctor       # Diagnose any issues
+# SSH tunnel (khuyến nghị)
+ssh -L 8788:localhost:8788 user@phone-ip
+
+# Hoặc Tailscale
+# Cài tailscale trên cả 2 máy, rồi truy cập http://phone-ip:8788
 ```
 
-📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
-
----
-
-## Skip the API-key collection — Nous Portal
-
-Hermes works with whatever provider you want — that's not changing. But if you'd rather not collect five separate API keys for the model, web search, image generation, TTS, and a cloud browser, **[Nous Portal](https://portal.nousresearch.com)** covers all of them under one subscription:
-
-- **300+ models** — pick any of them with `/model <name>`
-- **Tool Gateway** — web search (Firecrawl), image generation (FAL), text-to-speech (OpenAI), cloud browser (Browser Use), all routed through your sub. No extra accounts.
-
-One command from a fresh install:
+### Revoke token
 
 ```bash
-hermes setup --portal
+python -m agent.unified.dashboard_server --new-token
 ```
 
-That logs you in via OAuth, sets Nous as your provider, and turns on the Tool Gateway. Check what's wired up any time with `hermes portal info`. Full details on the [Tool Gateway docs page](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway).
-
-You can still bring your own keys per-tool whenever you want — the gateway is per-backend, not all-or-nothing.
-
 ---
 
-## CLI vs Messaging Quick Reference
+## ⚙️ Cấu hình
 
-Hermes has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
+### File `~/.hermes/config.yaml`
 
-| Action                         | CLI                                           | Messaging platforms                                                              |
-| ------------------------------ | --------------------------------------------- | -------------------------------------------------------------------------------- |
-| Start chatting                 | `hermes`                                      | Run `hermes gateway setup` + `hermes gateway start`, then send the bot a message |
-| Start fresh conversation       | `/new` or `/reset`                            | `/new` or `/reset`                                                               |
-| Change model                   | `/model [provider:model]`                     | `/model [provider:model]`                                                        |
-| Set a personality              | `/personality [name]`                         | `/personality [name]`                                                            |
-| Retry or undo the last turn    | `/retry`, `/undo`                             | `/retry`, `/undo`                                                                |
-| Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]`                                        |
-| Browse skills                  | `/skills` or `/<skill-name>`                  | `/<skill-name>`                                                                  |
-| Interrupt current work         | `Ctrl+C` or send a new message                | `/stop` or send a new message                                                    |
-| Platform-specific status       | `/platforms`                                  | `/status`, `/sethome`                                                            |
+```yaml
+model:
+  provider: xiaomi          # zai, openai, anthropic, openrouter...
+  default: mimo-v2.5        # model name
+  base_url: https://api.xiaomimimo.com/v1
 
-For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
+unified:
+  reasoning:
+    enabled: true
+  verifier:
+    enabled: true
+  slow_thinking:
+    enabled: true
+    default_level: balanced  # fast, balanced, deep, max
+  # ... 21 features tổng cộng
+```
 
----
-
-## Documentation
-
-All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
-
-| Section                                                                                             | What's Covered                                             |
-| --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| [Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart)                 | Install → setup → first conversation in 2 minutes          |
-| [CLI Usage](https://hermes-agent.nousresearch.com/docs/user-guide/cli)                              | Commands, keybindings, personalities, sessions             |
-| [Configuration](https://hermes-agent.nousresearch.com/docs/user-guide/configuration)                | Config file, providers, models, all options                |
-| [Messaging Gateway](https://hermes-agent.nousresearch.com/docs/user-guide/messaging)                | Telegram, Discord, Slack, WhatsApp, Signal, Home Assistant |
-| [Security](https://hermes-agent.nousresearch.com/docs/user-guide/security)                          | Command approval, DM pairing, container isolation          |
-| [Tools & Toolsets](https://hermes-agent.nousresearch.com/docs/user-guide/features/tools)            | 40+ tools, toolset system, terminal backends               |
-| [Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)              | Procedural memory, Skills Hub, creating skills             |
-| [Memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory)                     | Persistent memory, user profiles, best practices           |
-| [MCP Integration](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)               | Connect any MCP server for extended capabilities           |
-| [Cron Scheduling](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)              | Scheduled tasks with platform delivery                     |
-| [Context Files](https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files)       | Project context that shapes every conversation             |
-| [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)             | Project structure, agent loop, key classes                 |
-| [Contributing](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing)             | Development setup, PR process, code style                  |
-| [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands)                  | All commands and flags                                     |
-| [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference                                 |
-
----
-
-## Migrating from OpenClaw
-
-If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.
-
-**During first-time setup:** The setup wizard (`hermes setup`) automatically detects `~/.openclaw` and offers to migrate before configuration begins.
-
-**Anytime after install:**
+### File `~/.hermes/.env`
 
 ```bash
-hermes claw migrate              # Interactive migration (full preset)
-hermes claw migrate --dry-run    # Preview what would be migrated
-hermes claw migrate --preset user-data   # Migrate without secrets
-hermes claw migrate --overwrite  # Overwrite existing conflicts
+XIAOMI_API_KEY=sk-...
+HERMES_INFERENCE_PROVIDER=xiaomi
+HERMES_INFERENCE_MODEL=mimo-v2.5
+HERMES_YOLO_MODE=1
+HERMES_ACCEPT_HOOKS=1
 ```
 
-What gets imported:
+### Providers hỗ trợ
 
-- **SOUL.md** — persona file
-- **Memories** — MEMORY.md and USER.md entries
-- **Skills** — user-created skills → `~/.hermes/skills/openclaw-imports/`
-- **Command allowlist** — approval patterns
-- **Messaging settings** — platform configs, allowed users, working directory
-- **API keys** — allowlisted secrets (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **TTS assets** — workspace audio files
-- **Workspace instructions** — AGENTS.md (with `--workspace-target`)
-
-See `hermes claw migrate --help` for all options, or use the `openclaw-migration` skill for an interactive agent-guided migration with dry-run previews.
+| Provider | Base URL | Default Model |
+|----------|----------|---------------|
+| **z.ai (GLM)** | `https://open.bigmodel.cn/api/paas/v4` | glm-4.6 |
+| **Xiaomi MiMo** | `https://api.xiaomimimo.com/v1` | mimo-v2.5 |
+| **OpenAI** | `https://api.openai.com/v1` | gpt-4o-mini |
+| **Anthropic** | `https://api.anthropic.com` | claude-3-5-sonnet |
+| **OpenRouter** | `https://openrouter.ai/api/v1` | openai/gpt-4o-mini |
+| **DeepSeek** | `https://api.deepseek.com/v1` | deepseek-chat |
+| **Groq** | `https://api.groq.com/openai/v1` | llama-3.1-70b |
+| **Together** | `https://api.together.xyz/v1` | llama-3-70b |
+| **Mistral** | `https://api.mistral.ai/v1` | mistral-large |
+| **Custom** | any | any |
 
 ---
 
-## Contributing
+## 📱 Chạy trên UserLAnd
 
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
+### Yêu cầu
 
-Quick start for contributors — use the standard installer, then work from the
-full git checkout it creates at `$HERMES_HOME/hermes-agent` (usually
-`~/.hermes/hermes-agent`). This matches the layout used by `hermes update`, the
-managed venv, lazy dependencies, gateway, and docs tooling.
+- UserLAnd app (Android)
+- Ubuntu distro
+- Python 3.11+
+
+### Cài đặt
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
-uv pip install -e ".[all,dev]"
-scripts/run_tests.sh
+# Trong UserLAnd terminal
+sudo apt update && sudo apt install -y python3 python3-pip git
+
+git clone https://github.com/airdropp20208-star/hermes-omni.git
+cd hermes-omni
+
+pip install -e .
+pip install pyyaml openai httpx requests
+
+# Set API key
+export XIAOMI_API_KEY=sk-...
+echo "XIAOMI_API_KEY=sk-..." > ~/.hermes/.env
+
+# Khởi động
+./start.sh
 ```
 
-Manual clone fallback (for throwaway clones/CI where you intentionally do not
-want the managed install layout):
+### Truy cập từ browser điện thoại
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv .venv --python 3.11
-source .venv/bin/activate
-uv pip install -e ".[all,dev]"
-scripts/run_tests.sh
+# Dashboard chạy trên 127.0.0.1:8788
+# Mở Chrome → http://localhost:8788
+```
+
+### Tips cho UserLAnd
+
+- **Cold start chat:** 30-60s (do subprocess spawn)
+- **Memory:** ~150MB server + ~500MB khi chat
+- **Battery:** Chat tốn CPU, hạn chế chat dài
+- **Network:** Bind localhost, dùng SSH tunnel nếu truy cập từ PC
+
+---
+
+## 🔧 Khắc phục sự cố
+
+### Server không khởi động
+
+```bash
+# Check port có bị busy không
+lsof -i :8788
+
+# Kill process cũ
+pkill -f dashboard_server
+
+# Restart
+./start.sh
+```
+
+### Chat không trả lời
+
+```bash
+# Check API key
+cat ~/.hermes/.env
+
+# Test key trực tiếp
+curl -X POST https://api.xiaomimimo.com/v1/chat/completions \
+  -H "Authorization: Bearer $XIAOMI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### Quên token
+
+```bash
+# Xem token
+cat ~/.hermes/.dashboard_token
+
+# Hoặc tạo token mới
+python -m agent.unified.dashboard_server --new-token
+```
+
+### Browser không kết nối được
+
+```bash
+# Check server đang chạy
+pgrep -f dashboard_server
+
+# Check bind
+ss -tlnp | grep 8788
+
+# Restart
+pkill -f dashboard_server && ./start.sh
+```
+
+### Log debug
+
+```bash
+# Server log
+tail -f /tmp/dash*.log
+
+# Chat log (in trong terminal)
+# [chat] start: 'message'
+# [chat] done in 32.5s, rc=0, out=1B, err=0B
 ```
 
 ---
 
-## Community
+## 📊 Kiến trúc
 
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Linux desktop-control MCP server for Hermes and other MCP hosts, with AT-SPI accessibility trees, Wayland/X11 input, screenshots, and compositor window targeting.
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
+```
+hermes-omni/
+├── agent/
+│   └── unified/
+│       ├── dashboard_server.py    # Web dashboard v6
+│       ├── reasoning.py           # Pipeline chính
+│       ├── verifier.py            # Tự kiểm tra
+│       ├── constitution.py        # Nguyên tắc
+│       ├── slow_thinking.py       # Suy luận sâu
+│       ├── skill_registry.py      # 113 skills
+│       ├── ...                    # 44 modules
+│       └── runtime_wiring.py      # 7 hooks
+├── hermes_cli/                    # CLI (fork từ Hermes)
+├── run_agent.py                   # AIAgent class
+├── tools/                         # Agent tools
+├── skills/local-repos/            # Skill repos
+├── scripts/
+│   ├── evaluate_cognitive.py      # Evaluation
+│   └── clone-skills.sh            # Clone skills
+├── start.sh                       # Launcher
+└── install.sh                     # Installer
+```
 
 ---
 
-## License
+## 🤝 Đóng góp
 
-MIT — see [LICENSE](LICENSE).
+Đây là fork của [Hermes Agent](https://github.com/NousResearch/hermes-agent) bởi Nous Research. Các modules bổ sung được phát triển riêng cho Hermes-Omni.
 
-Built by [Nous Research](https://nousresearch.com).
+### Chạy evaluation
+
+```bash
+python scripts/evaluate_cognitive.py
+# 100% pass cho 44 modules
+```
+
+---
+
+## 📜 License
+
+MIT License — xem [LICENSE](LICENSE).
+
+<div align="center">
+
+**⚡ Hermes-Omni — Agent AI tự cải tiến**
+
+</div>
