@@ -122,7 +122,11 @@ def _build_llm_call(agent: Any):
             try:
                 # OpenAI-compatible call. Works for most providers
                 # (OpenAI, OpenRouter, Nous, GLM, DeepSeek, etc.)
-                response = client.chat.completions.create(
+                # Inject chat_template_kwargs for mimo to control reasoning.
+                # This mirrors the xiaomi provider profile's build_extra_body()
+                # so cognitive modules (verifier, constitution, etc.) get the
+                # same speed boost as the main agent call.
+                kwargs = dict(
                     model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -131,6 +135,13 @@ def _build_llm_call(agent: Any):
                     temperature=0.3,  # low temp for structured output
                     max_tokens=4096,
                 )
+                # Mimo-specific: respect agent's reasoning_config
+                rc = getattr(agent, "reasoning_config", None) or {}
+                provider = getattr(agent, "provider", "") or ""
+                if provider == "xiaomi":
+                    enable_thinking = not (isinstance(rc, dict) and rc.get("enabled") is False)
+                    kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+                response = client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content or ""
             except Exception as exc:
                 logger.debug("cognitive llm_call failed: %r", exc)

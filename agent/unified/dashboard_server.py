@@ -572,44 +572,49 @@ def _send_to_agent_fast(message: str, timeout: int = 45, thinking: bool = False)
 _fast_conversation_history = []  # separate history for fast mode
 
 
-# ─── Cached AIAgent (init once, reuse) ──────────────────────────────────────
+# ─── Cached AIAgent (3 modes: fast/thinking/max) ────────────────────────────
 
-_cached_agent = None
-_cached_agent_signature = None
+_agent_cache: dict = {}  # mode → (agent, signature)
 _agent_lock = threading.Lock()
+_conversation_histories: dict = {}  # mode → list of messages
 
 
-def _get_cached_agent():
-    """Get or build cached AIAgent instance. Rebuild if config changes.
+def _get_agent_for_mode(mode: str):
+    """Get or build cached AIAgent for given mode.
     
-    Caching saves 5-10s per chat (no re-init of LLM client, tools, memory).
+    3 modes (ALL are real agents with tools + 44 modules):
+    - fast: reasoning_config={"enabled": False} → mimo enable_thinking=False → 2-5s
+    - thinking: reasoning_config={"enabled": True, "effort": "low"} → 10-20s
+    - max: reasoning_config={"enabled": True, "effort": "high"} → 30-60s
+    
+    Agent cached per mode → no rebuild cost on subsequent chats.
+    Prompt caching: mimo caches system prompt automatically (cached_tokens).
     """
-    global _cached_agent, _cached_agent_signature
+    valid_modes = {"fast", "thinking", "max"}
+    if mode not in valid_modes:
+        mode = "thinking"
     
-    # Build signature from config to detect changes
+    # Build signature from config
     config = _read_yaml(HERMES_HOME / "config.yaml")
     model_cfg = config.get("model", {}) if config else {}
     signature = f"{model_cfg.get('provider','')}|{model_cfg.get('default','')}|{model_cfg.get('base_url','')}"
-    
-    if _cached_agent is not None and _cached_agent_signature == signature:
-        return _cached_agent, True  # cached, reused
-    
+
+    cached = _agent_cache.get(mode)
+    if cached is not None and cached[1] == signature:
+        return cached[0], True
+
     with _agent_lock:
-        # Double-check after acquiring lock
-        if _cached_agent is not None and _cached_agent_signature == signature:
-            return _cached_agent, True
-        
-        # Build new agent
+        cached = _agent_cache.get(mode)
+        if cached is not None and cached[1] == signature:
+            return cached[0], True
+
         import logging
         logging.disable(logging.CRITICAL)
-        
+
         os.environ["HERMES_YOLO_MODE"] = "1"
         os.environ["HERMES_ACCEPT_HOOKS"] = "1"
         os.environ.setdefault("HERMES_HOME", str(HERMES_HOME))
-        # Adaptive: no hard cap. Agent stops when done.
-        # (was 90 default, we let it run naturally)
-        
-        # Load .env
+
         env_path = HERMES_HOME / ".env"
         if env_path.exists():
             for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -618,7 +623,7 @@ def _get_cached_agent():
                     continue
                 k, v = line.split("=", 1)
                 os.environ[k.strip()] = v.strip()
-        
+
         try:
             from hermes_cli.config import load_config
             from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -626,27 +631,35 @@ def _get_cached_agent():
             from hermes_cli.fallback_config import get_fallback_chain
             from hermes_cli.oneshot import _create_session_db_for_oneshot, _oneshot_clarify_callback
             from run_agent import AIAgent
-            
+
             cfg = load_config()
             model_cfg = cfg.get("model") or {}
             cfg_model = model_cfg.get("default") or model_cfg.get("model") or "" if isinstance(model_cfg, dict) else str(model_cfg)
             env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
             effective_model = env_model or cfg_model
-            
+
             cfg_provider = ""
             if isinstance(model_cfg, dict):
                 cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
             current_provider = cfg_provider or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
-            
+
             runtime = resolve_runtime_provider(
                 requested=current_provider,
                 target_model=effective_model or None,
             )
-            
+
             toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
             session_db = _create_session_db_for_oneshot()
             _fb = get_fallback_chain(cfg)
-            
+
+            # Reasoning config per mode
+            if mode == "fast":
+                reasoning_config = {"enabled": False}
+            elif mode == "thinking":
+                reasoning_config = {"enabled": True, "effort": "low"}
+            else:  # max
+                reasoning_config = {"enabled": True, "effort": "high"}
+
             agent = AIAgent(
                 api_key=runtime.get("api_key"),
                 base_url=runtime.get("base_url"),
@@ -660,67 +673,72 @@ def _get_cached_agent():
                 credential_pool=runtime.get("credential_pool"),
                 fallback_model=_fb or None,
                 clarify_callback=_oneshot_clarify_callback,
+                reasoning_config=reasoning_config,
             )
             agent.suppress_status_output = True
             agent.stream_delta_callback = None
             agent.tool_gen_callback = None
-            
-            _cached_agent = agent
-            _cached_agent_signature = signature
-            print(f"[agent] cached built (provider={current_provider}, model={effective_model})", flush=True)
-            return agent, False  # freshly built
+
+            _agent_cache[mode] = (agent, signature)
+            print(f"[agent-{mode}] cached built (provider={current_provider}, model={effective_model}, reasoning={reasoning_config})", flush=True)
+            return agent, False
         except Exception as exc:
-            print(f"[agent] cache build failed: {type(exc).__name__}: {exc}", flush=True)
+            print(f"[agent-{mode}] cache build failed: {type(exc).__name__}: {exc}", flush=True)
             raise
 
 
-def _send_to_agent(message: str, timeout: int = 600) -> dict:
-    """Run agent IN-PROCESS with CACHED AIAgent + adaptive iterations.
+def _send_to_agent(message: str, mode: str = "thinking", timeout: int = 600) -> dict:
+    """Run agent IN-PROCESS with mode-specific reasoning config.
     
-    - No MAX_ITERATIONS cap (agent runs until done, like telegram gateway)
-    - No hard timeout (user can run long tasks)
-    - Cached agent: 5-10s faster than rebuild each time
-    - Adaptive: agent naturally stops when task complete
-    - Conversation history persists in-memory between messages
+    3 modes — ALL are real agents with tools + 44 modules:
+    - fast: no reasoning (mimo enable_thinking=False) → 2-5s
+    - thinking: low reasoning → 10-20s  
+    - max: high reasoning → 30-60s
     
-    For extremely long tasks (>10min), consider using gateway/telegram instead.
+    Agent cached per mode. Conversation history persists per mode.
+    MAX_ITERATIONS=90 (full agent capability, no cap).
+    Timeout 600s (10 min — enough for long tasks).
     """
     if not message or not message.strip():
         return {"success": False, "error": "Tin nhắn trống"}
-    
+
+    valid_modes = {"fast", "thinking", "max"}
+    if mode not in valid_modes:
+        mode = "thinking"
+
     with _chat_lock:
         start = time.time()
-        print(f"[agent] start: {message[:80]!r}", flush=True)
-        
-        global _conversation_history
+        print(f"[agent-{mode}] start: {message[:80]!r}", flush=True)
+
         try:
-            agent, reused = _get_cached_agent()
+            agent, reused = _get_agent_for_mode(mode)
             init_time = time.time() - start
             if not reused:
-                print(f"[agent] init took {init_time:.1f}s", flush=True)
+                print(f"[agent-{mode}] init took {init_time:.1f}s", flush=True)
             else:
-                print(f"[agent] reused cached (init 0s)", flush=True)
-            
-            # Run conversation with history (like gateway does)
+                print(f"[agent-{mode}] reused cached (init 0s)", flush=True)
+
+            # Get conversation history for this mode
+            history = _conversation_histories.setdefault(mode, [])
+
             from agent.conversation_loop import run_conversation
             result = run_conversation(
                 agent,
                 user_message=message,
-                conversation_history=_conversation_history,
+                conversation_history=history,
             )
-            _conversation_history = result.get("messages", _conversation_history)
+            _conversation_histories[mode] = result.get("messages", history)
             response = result.get("final_response", "")
-            
-            # Fallback: find last assistant message
+
             if not response:
-                for msg in reversed(_conversation_history):
+                for msg in reversed(_conversation_histories[mode]):
                     if msg.get("role") == "assistant" and msg.get("content"):
                         response = msg["content"]
                         break
-            
+
             elapsed = time.time() - start
-            print(f"[agent] done in {elapsed:.1f}s (init {init_time:.1f}s + chat {elapsed-init_time:.1f}s), response={len(response or '')}B", flush=True)
-            
+            print(f"[agent-{mode}] done in {elapsed:.1f}s (init {init_time:.1f}s + chat {elapsed-init_time:.1f}s), response={len(response or '')}B", flush=True)
+
             if response and response.strip():
                 lines = [l for l in response.splitlines() if l.strip()
                          and not l.startswith("[Note:")
@@ -731,28 +749,44 @@ def _send_to_agent(message: str, timeout: int = 600) -> dict:
                     "success": True,
                     "response": cleaned,
                     "elapsed": round(elapsed, 1),
-                    "mode": "agent",
+                    "mode": mode,
                     "reused_cache": reused,
                 }
             return {"success": False, "error": "Agent không trả response"}
         except Exception as exc:
             elapsed = time.time() - start
             tb = traceback.format_exc()
-            print(f"[agent] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
-            # Invalidate cache on error (might be stale)
-            global _cached_agent
-            _cached_agent = None
+            print(f"[agent-{mode}] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
+            # Invalidate cache for this mode
+            with _agent_lock:
+                _agent_cache.pop(mode, None)
             return {"success": False, "error": f"{type(exc).__name__}: {exc}", "traceback": tb[-800:]}
 
 
 def _reset_agent_cache():
-    """Force rebuild agent on next chat (e.g. after config change)."""
-    global _cached_agent, _cached_agent_signature, _conversation_history
+    """Force rebuild all cached agents (e.g. after config change)."""
+    global _agent_cache, _conversation_histories
     with _agent_lock:
-        _cached_agent = None
-        _cached_agent_signature = None
-        _conversation_history = []
-    print("[agent] cache invalidated", flush=True)
+        _agent_cache = {}
+        _conversation_histories = {}
+    print("[agent] all caches invalidated", flush=True)
+
+
+def _prewarm_agents():
+    """Pre-build all 3 agents on server start (background thread).
+    
+    First chat for each mode will be instant (no init wait).
+    """
+    def warm():
+        for mode in ["fast", "thinking", "max"]:
+            try:
+                print(f"[prewarm] building {mode} agent...", flush=True)
+                t0 = time.time()
+                _get_agent_for_mode(mode)
+                print(f"[prewarm] {mode} ready in {time.time()-t0:.1f}s", flush=True)
+            except Exception as e:
+                print(f"[prewarm] {mode} failed: {e}", flush=True)
+    threading.Thread(target=warm, daemon=True).start()
 
 
 # ─── Actions ────────────────────────────────────────────────────────────────
@@ -1347,9 +1381,9 @@ select.search option{background:var(--card);color:var(--text)}
     <div class="mode-panel" id="modePanel">
       <div class="mode-bar">
         <div class="mode-group"><span class="mode-label">🚀 Engine</span>
-          <button class="mode-btn active" data-mt="engine" data-mv="fast" title="Mimo không reasoning — 2-3s, không agent">⚡ Fast</button>
-          <button class="mode-btn" data-mt="engine" data-mv="thinking" title="Mimo có reasoning — 30-45s, không agent">🧠 Thinking</button>
-          <button class="mode-btn" data-mt="engine" data-mv="full" title="Agent thật: reasoning + tools + 44 modules — 30-90s">🤖 Agent</button>
+          <button class="mode-btn active" data-mt="engine" data-mv="fast" title="Agent + tools, không reasoning — 2-5s">⚡ Fast</button>
+          <button class="mode-btn" data-mt="engine" data-mv="thinking" title="Agent + tools + reasoning thấp — 10-20s">🧠 Thinking</button>
+          <button class="mode-btn" data-mt="engine" data-mv="max" title="Agent + tools + reasoning cao — 30-60s">🚀 Max</button>
         </div>
         <div class="mode-divider"></div>
         <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
@@ -1583,7 +1617,7 @@ async function send(){
   sendBtn.disabled = true;
   sendBtn.textContent = '⏳...';
   addM('user', m);
-  const engineLabel = curMode.engine === 'fast' ? '⚡ Fast' : curMode.engine === 'thinking' ? '🧠 Thinking' : '🤖 Agent';
+  const engineLabel = curMode.engine === 'fast' ? '⚡ Fast' : curMode.engine === 'thinking' ? '🧠 Thinking' : '🚀 Max';
   addM('sys', '⏳ ' + engineLabel + ' đang suy nghĩ...');
   try {
     const r = await post('chat', {message:m, engine: curMode.engine});
@@ -2227,13 +2261,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = {}
 
         routes = {
-            "/api/action/chat": lambda: (
-                _send_to_agent_fast(data.get("message", ""), thinking=False)
-                if data.get("engine", "fast") == "fast"
-                else (_send_to_agent_fast(data.get("message", ""), thinking=True)
-                      if data.get("engine") == "thinking"
-                      else _send_to_agent(data.get("message", "")))
-            ),
+            "/api/action/chat": lambda: _send_to_agent(data.get("message", ""), mode=data.get("engine", "fast")),
             "/api/action/setup-provider": lambda: _action_setup_provider(data),
             "/api/action/test-key": lambda: _action_test_key(data),
             "/api/action/toggle-config": lambda: _action_toggle_config(data),
@@ -2466,8 +2494,12 @@ def run_server(port: int = 8788, host: str = "127.0.0.1") -> None:
 
     print(f"\n  ▶ Server chạy tại: http://{host}:{actual_port}", flush=True)
     print(f"  ▶ Token: {token}", flush=True)
-    print(f"  ▶ Mở browser → nhập token khi được hỏi", flush=True)
+    print(f"  ▶ 3 modes: ⚡ Fast (2-5s) · 🧠 Thinking (10-20s) · 🚀 Max (30-60s)", flush=True)
+    print(f"  ▶ Pre-warming agents trong background...", flush=True)
     print(f"  Ctrl+C để dừng\n", flush=True)
+
+    # Pre-warm all 3 agents in background (first chat will be instant)
+    _prewarm_agents()
 
     try:
         server.serve_forever()
