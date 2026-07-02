@@ -934,15 +934,15 @@ select.search option{background:var(--card);color:var(--text)}
 </nav>
 <div class="main">
 <div class="topbar"><div class="topbar-title" id="vt">Trò chuyện</div><div class="topbar-actions">
-<span class="badge badge-g" id="as">● Agent</span><span class="badge badge-r" id="gs">GW: Off</span>
+<span class="badge badge-r" id="gs">GW: Off</span>
 <button class="btn btn-h" onclick="startGW()">Bật Gateway</button></div></div>
 
 <div id="chat" class="chat-view active">
-  <div class="chat-msgs" id="cm"><div class="msg sys">💬 Trò chuyện với Hermes. Agent tự khởi động khi bật bảng điều khiển.</div></div>
+  <div class="chat-msgs" id="cm"><div class="msg sys">Hermes-Omni • Hỏi gì cũng được</div></div>
   <div class="chat-bottom">
     <div class="file-area" id="fa" onclick="document.getElementById('fi').click()">📎 Kéo thả tệp hoặc nhấn để chọn<input type="file" id="fi" multiple style="display:none" onchange="upF(this.files)"></div>
     <div class="file-list" id="fl"></div>
-    <div class="mode-bar">
+    <div class="mode-bar" id="modeBar" style="display:none">
       <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
         <button class="mode-btn" onclick="setMode('thinking','fast',this)">Fast</button>
         <button class="mode-btn active" onclick="setMode('thinking','balanced',this)">Balanced</button>
@@ -961,11 +961,12 @@ select.search option{background:var(--card);color:var(--text)}
         <button class="mode-btn" onclick="setMode('verify','off',this)">Off</button>
         <button class="mode-btn active" onclick="setMode('verify','on',this)">On</button>
       </div>
-      <span class="mode-info" id="mode-info">balanced · std · verify</span>
+      <span class="mode-info" id="mode-info" style="display:none">balanced · std · verify</span>
     </div>
     <div class="chat-input-row">
       <textarea id="ci" placeholder="Nhập tin nhắn cho Hermes..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea>
-      <button class="btn btn-p" onclick="send()">Gửi ➤</button>
+      <button class="btn btn-h" onclick="document.getElementById('modeBar').style.display=document.getElementById('modeBar').style.display=='none'?'flex':'none'" style="font-size:.65rem;padding:.3rem .5rem" title="Chế độ suy luận">⚙️</button>
+<button class="btn btn-p" onclick="send()">Gửi ➤</button>
     </div>
   </div>
 </div>
