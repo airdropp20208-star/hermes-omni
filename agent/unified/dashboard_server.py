@@ -820,6 +820,9 @@ def _send_to_agent(message: str, mode: str = "thinking", timeout: int = 600, str
                         pass
 
             _conversation_histories[mode] = result.get("messages", history)
+            # Bound history to last 20 messages (prevents unbounded memory + keeps mimo cache warm)
+            if len(_conversation_histories[mode]) > 20:
+                _conversation_histories[mode] = _conversation_histories[mode][-20:]
             response = result.get("final_response", "")
 
             if not response:
@@ -865,17 +868,29 @@ def _reset_agent_cache():
 
 
 def _prewarm_agents():
-    """Pre-build all 3 agents on server start (background thread).
-    
-    First chat for each mode will be instant (no init wait).
+    """Pre-build + pre-warm all 3 agents on server start (background thread).
+
+    Building the agent object is fast (~1s), but the FIRST run_conversation()
+    triggers lazy imports (mcp_tool, jsonschema, lark) that take 5-7s.
+    By running a throwaway chat during prewarm, first real user chat is instant.
     """
     def warm():
         for mode in ["fast", "thinking", "max"]:
             try:
                 print(f"[prewarm] building {mode} agent...", flush=True)
                 t0 = time.time()
-                _get_agent_for_mode(mode)
-                print(f"[prewarm] {mode} ready in {time.time()-t0:.1f}s", flush=True)
+                agent, _ = _get_agent_for_mode(mode)
+                print(f"[prewarm] {mode} agent built in {time.time()-t0:.1f}s", flush=True)
+                # Run throwaway chat to warm imports (mcp, jsonschema, etc.)
+                # This is the REAL optimization: cold imports happen here, not on user's first chat
+                t1 = time.time()
+                try:
+                    agent.run_conversation("hi")
+                    print(f"[prewarm] {mode} imports warmed in {time.time()-t1:.1f}s", flush=True)
+                except Exception as e:
+                    print(f"[prewarm] {mode} warm chat failed (OK): {e}", flush=True)
+                # Clear conversation history from warmup
+                _conversation_histories.pop(mode, None)
             except Exception as e:
                 print(f"[prewarm] {mode} failed: {e}", flush=True)
     threading.Thread(target=warm, daemon=True).start()
@@ -1000,6 +1015,11 @@ def _action_toggle_config(data: dict) -> dict:
         cur = cur[p]
     cur[parts[-1]] = not bool(cur.get(parts[-1], False))
     _write_yaml(config_path, config)
+    # Invalidate agent cache so next chat picks up new config
+    try:
+        _reset_agent_cache()
+    except Exception:
+        pass
     return {"success": True, "config": _get_config()}
 
 
@@ -1029,6 +1049,11 @@ def _action_set_mode(data: dict) -> dict:
     sg = unified.setdefault("smart_guardian", {})
     sg["enabled"] = verify == "on"
     _write_yaml(config_path, config)
+    # Invalidate agent cache so next chat rebuilds with new config
+    try:
+        _reset_agent_cache()
+    except Exception:
+        pass
     return {
         "success": True,
         "message": f"Mode: thinking={thinking}, reasoning={reasoning}, verify={verify}",
@@ -1734,20 +1759,26 @@ function logout(){
 }
 
 // ─── Chat ───
+// Throttled render with requestAnimationFrame (prevents 50+ reflows/sec during SSE streaming)
+let _renderRAF = null;
 function render(){
-  const c = document.getElementById('cm');
-  const v = msgs.slice(-visCount);
-  let h = '';
-  if (msgs.length > visCount) {
-    h += '<div class="load-more" id="lm">↑ Tải cũ hơn ('+(msgs.length-visCount)+' tin)</div>';
-  }
-  v.forEach(m => {
-    h += '<div class="msg '+m.t+'">'+(m.t==='user'?esc(m.c):m.t==='sys'?m.c:fmtR(m.c))+'</div>';
+  if (_renderRAF) return; // already scheduled
+  _renderRAF = requestAnimationFrame(() => {
+    _renderRAF = null;
+    const c = document.getElementById('cm');
+    const v = msgs.slice(-visCount);
+    let h = '';
+    if (msgs.length > visCount) {
+      h += '<div class="load-more" id="lm">↑ Tải cũ hơn ('+(msgs.length-visCount)+' tin)</div>';
+    }
+    v.forEach(m => {
+      h += '<div class="msg '+m.t+'">'+(m.t==='user'?esc(m.c):m.t==='sys'?m.c:fmtR(m.c))+'</div>';
+    });
+    c.innerHTML = h;
+    c.scrollTop = c.scrollHeight;
+    const lm = document.getElementById('lm');
+    if (lm) lm.onclick = () => { visCount += 25; render(); };
   });
-  c.innerHTML = h;
-  c.scrollTop = c.scrollHeight;
-  const lm = document.getElementById('lm');
-  if (lm) lm.onclick = () => { visCount += 25; render(); };
 }
 function addM(t, c){ msgs.push({t, c}); render(); }
 
@@ -2335,8 +2366,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _check_security(self) -> bool:
         """Returns True if request passes all security checks. Sends 403/429 if not."""
         # 1. DNS-rebinding guard: only allow localhost host header
+        # Empty Host = HTTP/1.0 or malformed → block (don't bypass)
         host = self.headers.get("Host", "").split(":")[0].lower()
-        if host and host not in _ALLOWED_HOSTS:
+        if host not in _ALLOWED_HOSTS:
             try:
                 self.send_response(403)
                 self.send_header("Content-Type", "text/plain")
@@ -2498,9 +2530,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         GET /api/chat/stream?message=...&engine=fast|thinking|max
         Returns: text/event-stream with data: {type:token|done|error, ...}
         """
-        # Auth check
-        if not self._check_security():
-            return
+        # NOTE: do_GET already called _check_security() before dispatching here.
+        # Don't double-check (would double-count rate limit + re-read token file).
         try:
             from urllib.parse import parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -2537,8 +2568,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     item = q.get(timeout=600)
                 except Exception:
                     break
-                if item == "__done__":
-                    result = q.get(timeout=1)
+                if isinstance(item, tuple) and item[0] == "__done__":
+                    result = item[1] if len(item) > 1 else {}
                     data = json.dumps({"type": "done", "response": result.get("response",""), "elapsed": result.get("elapsed",0), "mode": result.get("mode","")}, ensure_ascii=False)
                     self._safe_write(f"data: {data}\n\n".encode())
                     break
