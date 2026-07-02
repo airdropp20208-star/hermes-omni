@@ -965,7 +965,7 @@ select.search option{background:var(--card);color:var(--text)}
     </div>
     <div class="chat-input-row">
       <textarea id="ci" placeholder="Nhập tin nhắn cho Hermes..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea>
-      <button class="btn btn-h" onclick="document.getElementById('modeBar').style.display=document.getElementById('modeBar').style.display=='none'?'flex':'none'" style="font-size:.65rem;padding:.3rem .5rem" title="Chế độ suy luận">⚙️</button>
+      <button class="btn btn-h" onclick="document.getElementById('modePanel').style.display=document.getElementById('modePanel').style.display=='none'?'block':'none'" style="font-size:.65rem;padding:.3rem .5rem" title="Chế độ suy luận">⚙️</button>
 <button class="btn btn-p" onclick="send()">Gửi ➤</button>
     </div>
   </div>
