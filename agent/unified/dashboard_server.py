@@ -462,6 +462,7 @@ def _get_logs() -> list:
 # ─── Chat (real agent via subprocess for isolation) ─────────────────────────
 
 _chat_lock = threading.Lock()
+_conversation_history = []  # persists between chats (in-memory, like gateway)
 
 
 def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
@@ -546,25 +547,42 @@ def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
             return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _send_to_agent(message: str, timeout: int = 120) -> dict:
-    """Run agent IN-PROCESS (not subprocess) for reliability.
+# ─── Cached AIAgent (init once, reuse) ──────────────────────────────────────
+
+_cached_agent = None
+_cached_agent_signature = None
+_agent_lock = threading.Lock()
+
+
+def _get_cached_agent():
+    """Get or build cached AIAgent instance. Rebuild if config changes.
     
-    Uses hermes_cli.oneshot._run_agent() — same as `hermes -z` but no subprocess.
-    - Real agent with reasoning + tools (44 modules active)
-    - MAX_ITERATIONS=5 (configurable via env) — prevents infinite tool loops
-    - Won't hang like subprocess can on UserLAnd/ARM64
-    - No cold start overhead (agent initialized once, cached)
+    Caching saves 5-10s per chat (no re-init of LLM client, tools, memory).
     """
-    if not message or not message.strip():
-        return {"success": False, "error": "Tin nhắn trống"}
+    global _cached_agent, _cached_agent_signature
     
-    with _chat_lock:
-        # Setup env
+    # Build signature from config to detect changes
+    config = _read_yaml(HERMES_HOME / "config.yaml")
+    model_cfg = config.get("model", {}) if config else {}
+    signature = f"{model_cfg.get('provider','')}|{model_cfg.get('default','')}|{model_cfg.get('base_url','')}"
+    
+    if _cached_agent is not None and _cached_agent_signature == signature:
+        return _cached_agent, True  # cached, reused
+    
+    with _agent_lock:
+        # Double-check after acquiring lock
+        if _cached_agent is not None and _cached_agent_signature == signature:
+            return _cached_agent, True
+        
+        # Build new agent
+        import logging
+        logging.disable(logging.CRITICAL)
+        
         os.environ["HERMES_YOLO_MODE"] = "1"
         os.environ["HERMES_ACCEPT_HOOKS"] = "1"
         os.environ.setdefault("HERMES_HOME", str(HERMES_HOME))
-        # Limit iterations to prevent hang (default 90 is too many)
-        os.environ.setdefault("HERMES_MAX_ITERATIONS", "5")
+        # Adaptive: no hard cap. Agent stops when done.
+        # (was 90 default, we let it run naturally)
         
         # Load .env
         env_path = HERMES_HOME / ".env"
@@ -576,30 +594,109 @@ def _send_to_agent(message: str, timeout: int = 120) -> dict:
                 k, v = line.split("=", 1)
                 os.environ[k.strip()] = v.strip()
         
-        # Disable logging (hermes logs a lot)
-        import logging
-        logging.disable(logging.CRITICAL)
-        
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            from hermes_cli.tools_config import _get_platform_tools
+            from hermes_cli.fallback_config import get_fallback_chain
+            from hermes_cli.oneshot import _create_session_db_for_oneshot, _oneshot_clarify_callback
+            from run_agent import AIAgent
+            
+            cfg = load_config()
+            model_cfg = cfg.get("model") or {}
+            cfg_model = model_cfg.get("default") or model_cfg.get("model") or "" if isinstance(model_cfg, dict) else str(model_cfg)
+            env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
+            effective_model = env_model or cfg_model
+            
+            cfg_provider = ""
+            if isinstance(model_cfg, dict):
+                cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            current_provider = cfg_provider or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
+            
+            runtime = resolve_runtime_provider(
+                requested=current_provider,
+                target_model=effective_model or None,
+            )
+            
+            toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+            session_db = _create_session_db_for_oneshot()
+            _fb = get_fallback_chain(cfg)
+            
+            agent = AIAgent(
+                api_key=runtime.get("api_key"),
+                base_url=runtime.get("base_url"),
+                provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                model=effective_model,
+                enabled_toolsets=toolsets_list,
+                quiet_mode=True,
+                platform="cli",
+                session_db=session_db,
+                credential_pool=runtime.get("credential_pool"),
+                fallback_model=_fb or None,
+                clarify_callback=_oneshot_clarify_callback,
+            )
+            agent.suppress_status_output = True
+            agent.stream_delta_callback = None
+            agent.tool_gen_callback = None
+            
+            _cached_agent = agent
+            _cached_agent_signature = signature
+            print(f"[agent] cached built (provider={current_provider}, model={effective_model})", flush=True)
+            return agent, False  # freshly built
+        except Exception as exc:
+            print(f"[agent] cache build failed: {type(exc).__name__}: {exc}", flush=True)
+            raise
+
+
+def _send_to_agent(message: str, timeout: int = 600) -> dict:
+    """Run agent IN-PROCESS with CACHED AIAgent + adaptive iterations.
+    
+    - No MAX_ITERATIONS cap (agent runs until done, like telegram gateway)
+    - No hard timeout (user can run long tasks)
+    - Cached agent: 5-10s faster than rebuild each time
+    - Adaptive: agent naturally stops when task complete
+    - Conversation history persists in-memory between messages
+    
+    For extremely long tasks (>10min), consider using gateway/telegram instead.
+    """
+    if not message or not message.strip():
+        return {"success": False, "error": "Tin nhắn trống"}
+    
+    with _chat_lock:
         start = time.time()
         print(f"[agent] start: {message[:80]!r}", flush=True)
+        
+        global _conversation_history
         try:
-            from hermes_cli.oneshot import _run_agent
-            # Run in thread with timeout (in-process can't be killed easily)
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_run_agent, message)
-                try:
-                    response = future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    elapsed = time.time() - start
-                    print(f"[agent] TIMEOUT after {elapsed:.1f}s", flush=True)
-                    return {"success": False, "error": f"Agent timeout sau {int(elapsed)}s — thử Fast mode hoặc câu ngắn hơn."}
+            agent, reused = _get_cached_agent()
+            init_time = time.time() - start
+            if not reused:
+                print(f"[agent] init took {init_time:.1f}s", flush=True)
+            else:
+                print(f"[agent] reused cached (init 0s)", flush=True)
+            
+            # Run conversation with history (like gateway does)
+            from agent.conversation_loop import run_conversation
+            result = run_conversation(
+                agent,
+                user_message=message,
+                conversation_history=_conversation_history,
+            )
+            _conversation_history = result.get("messages", _conversation_history)
+            response = result.get("final_response", "")
+            
+            # Fallback: find last assistant message
+            if not response:
+                for msg in reversed(_conversation_history):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        response = msg["content"]
+                        break
             
             elapsed = time.time() - start
-            print(f"[agent] done in {elapsed:.1f}s, response={len(response or '')}B", flush=True)
+            print(f"[agent] done in {elapsed:.1f}s (init {init_time:.1f}s + chat {elapsed-init_time:.1f}s), response={len(response or '')}B", flush=True)
             
             if response and response.strip():
-                # Clean up known non-response lines
                 lines = [l for l in response.splitlines() if l.strip()
                          and not l.startswith("[Note:")
                          and not l.startswith("Calling tool")
@@ -610,13 +707,27 @@ def _send_to_agent(message: str, timeout: int = 120) -> dict:
                     "response": cleaned,
                     "elapsed": round(elapsed, 1),
                     "mode": "agent",
+                    "reused_cache": reused,
                 }
             return {"success": False, "error": "Agent không trả response"}
         except Exception as exc:
             elapsed = time.time() - start
             tb = traceback.format_exc()
             print(f"[agent] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
+            # Invalidate cache on error (might be stale)
+            global _cached_agent
+            _cached_agent = None
             return {"success": False, "error": f"{type(exc).__name__}: {exc}", "traceback": tb[-800:]}
+
+
+def _reset_agent_cache():
+    """Force rebuild agent on next chat (e.g. after config change)."""
+    global _cached_agent, _cached_agent_signature, _conversation_history
+    with _agent_lock:
+        _cached_agent = None
+        _cached_agent_signature = None
+        _conversation_history = []
+    print("[agent] cache invalidated", flush=True)
 
 
 # ─── Actions ────────────────────────────────────────────────────────────────
@@ -672,6 +783,12 @@ def _action_setup_provider(data: dict) -> dict:
     os.environ["HERMES_INFERENCE_PROVIDER"] = provider
     if model:
         os.environ["HERMES_INFERENCE_MODEL"] = model
+
+    # Invalidate cached agent so next chat rebuilds with new config
+    try:
+        _reset_agent_cache()
+    except Exception:
+        pass
 
     return {
         "success": True,
