@@ -465,20 +465,22 @@ _chat_lock = threading.Lock()
 _conversation_history = []  # persists between chats (in-memory, like gateway)
 
 
-def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
-    """FAST MODE: Call LLM API directly (no hermes subprocess, no tools).
+def _send_to_agent_fast(message: str, timeout: int = 45, thinking: bool = False) -> dict:
+    """FAST MODE: Call LLM API directly with mimo thinking toggle.
     
-    Much faster + more reliable on UserLAnd/ARM64 where hermes subprocess
-    can hang due to tool calling loop.
+    thinking=False (default): disable reasoning → 2-3s response
+    thinking=True: enable reasoning → 30-45s response (full quality)
     
-    Returns plain text response from the model.
+    No hermes subprocess, no tools, no 44 modules overhead.
+    Pure LLM call with conversation history.
     """
     if not message or not message.strip():
         return {"success": False, "error": "Tin nhắn trống"}
     
     with _chat_lock:
         start = time.time()
-        print(f"[chat-fast] start: {message[:80]!r}", flush=True)
+        mode_label = "thinking" if thinking else "fast"
+        print(f"[chat-{mode_label}] start: {message[:80]!r}", flush=True)
         
         # Read config
         config = _read_yaml(HERMES_HOME / "config.yaml")
@@ -509,19 +511,31 @@ def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
         if not model:
             return {"success": False, "error": "Chưa có model."}
         
+        # Build messages with conversation history (in-memory)
+        global _fast_conversation_history
+        messages = [{"role": "system", "content": "Bạn là Hermes-Omni, trợ lý AI tiếng Việt thân thiện. Trả lời rõ ràng, hữu ích."}]
+        messages.extend(_fast_conversation_history[-10:])  # last 10 messages
+        messages.append({"role": "user", "content": message})
+        
+        # Build request body
+        # For mimo-v2.5 (reasoning model): chat_template_kwargs.enable_thinking controls reasoning
+        # thinking=False → 2-3s (no reasoning)
+        # thinking=True → 30-45s (full reasoning)
+        body_dict = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 2000 if thinking else 500,
+            "temperature": 0.7,
+        }
+        # Mimo-specific: disable thinking for speed
+        if provider == "xiaomi" and not thinking:
+            body_dict["chat_template_kwargs"] = {"enable_thinking": False}
+        
         # Call API directly using urllib (no external deps)
         try:
             from urllib.request import Request, urlopen
             url = f"{base_url.rstrip('/')}/chat/completions"
-            body = json.dumps({
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "Bạn là Hermes-Omni, trợ lý AI tiếng Việt thân thiện. Trả lời ngắn gọn, rõ ràng."},
-                    {"role": "user", "content": message},
-                ],
-                "max_tokens": 1000,
-                "temperature": 0.7,
-            }).encode("utf-8")
+            body = json.dumps(body_dict).encode("utf-8")
             req = Request(url, data=body, headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
@@ -531,20 +545,31 @@ def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
             content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
             elapsed = time.time() - start
             usage = result.get("usage", {})
-            print(f"[chat-fast] done in {elapsed:.1f}s, tokens={usage.get('total_tokens', '?')}", flush=True)
+            reasoning_tokens = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
+            print(f"[chat-{mode_label}] done in {elapsed:.1f}s, tokens={usage.get('total_tokens', '?')}, reasoning={reasoning_tokens}", flush=True)
+            
+            # Save to history
+            _fast_conversation_history.append({"role": "user", "content": message})
+            if content:
+                _fast_conversation_history.append({"role": "assistant", "content": content})
+            
             if content:
                 return {
                     "success": True,
                     "response": content.strip(),
                     "elapsed": round(elapsed, 1),
                     "tokens": usage.get("total_tokens", 0),
-                    "mode": "fast",
+                    "reasoning_tokens": reasoning_tokens,
+                    "mode": mode_label,
                 }
-            return {"success": False, "error": "API trả response rỗng"}
+            return {"success": False, "error": "API trả response rỗng (có thể do max_tokens quá thấp cho reasoning)"}
         except Exception as exc:
             elapsed = time.time() - start
-            print(f"[chat-fast] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
+            print(f"[chat-{mode_label}] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
             return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+_fast_conversation_history = []  # separate history for fast mode
 
 
 # ─── Cached AIAgent (init once, reuse) ──────────────────────────────────────
@@ -1322,8 +1347,9 @@ select.search option{background:var(--card);color:var(--text)}
     <div class="mode-panel" id="modePanel">
       <div class="mode-bar">
         <div class="mode-group"><span class="mode-label">🚀 Engine</span>
-          <button class="mode-btn" data-mt="engine" data-mv="fast" title="Gọi API trực tiếp — nhanh 2-3s, không agent">Fast</button>
-          <button class="mode-btn active" data-mt="engine" data-mv="full" title="Agent thật: reasoning + tools + 44 modules">Agent</button>
+          <button class="mode-btn active" data-mt="engine" data-mv="fast" title="Mimo không reasoning — 2-3s, không agent">⚡ Fast</button>
+          <button class="mode-btn" data-mt="engine" data-mv="thinking" title="Mimo có reasoning — 30-45s, không agent">🧠 Thinking</button>
+          <button class="mode-btn" data-mt="engine" data-mv="full" title="Agent thật: reasoning + tools + 44 modules — 30-90s">🤖 Agent</button>
         </div>
         <div class="mode-divider"></div>
         <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
@@ -1406,7 +1432,7 @@ const T = {
 };
 let msgs = [];
 let visCount = 25;
-let curMode = {engine:'full', thinking:'balanced', reasoning:'standard', verify:'on'};
+let curMode = {engine:'fast', thinking:'balanced', reasoning:'standard', verify:'on'};
 let sending = false;
 
 // ─── Navigation ───
@@ -1557,10 +1583,10 @@ async function send(){
   sendBtn.disabled = true;
   sendBtn.textContent = '⏳...';
   addM('user', m);
-  const engineLabel = curMode.engine === 'fast' ? '🚀 Fast' : '🧠 Agent';
+  const engineLabel = curMode.engine === 'fast' ? '⚡ Fast' : curMode.engine === 'thinking' ? '🧠 Thinking' : '🤖 Agent';
   addM('sys', '⏳ ' + engineLabel + ' đang suy nghĩ...');
   try {
-    const r = await post('chat', {message:m, fast: curMode.engine === 'fast' ? '1' : '0'});
+    const r = await post('chat', {message:m, engine: curMode.engine});
     // remove the "thinking..." message
     const last = msgs[msgs.length-1];
     if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
@@ -2202,9 +2228,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         routes = {
             "/api/action/chat": lambda: (
-                _send_to_agent_fast(data.get("message", ""))
-                if str(data.get("fast", "0")) == "1"
-                else _send_to_agent(data.get("message", ""))
+                _send_to_agent_fast(data.get("message", ""), thinking=False)
+                if data.get("engine", "fast") == "fast"
+                else (_send_to_agent_fast(data.get("message", ""), thinking=True)
+                      if data.get("engine") == "thinking"
+                      else _send_to_agent(data.get("message", "")))
             ),
             "/api/action/setup-provider": lambda: _action_setup_provider(data),
             "/api/action/test-key": lambda: _action_test_key(data),
