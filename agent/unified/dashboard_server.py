@@ -218,6 +218,8 @@ def _get_logs() -> list[dict]:
 
 _agent_process: subprocess.Popen | None = None
 _gateway_process: subprocess.Popen | None = None
+_agent_instance = None
+_conversation_history = []
 
 
 def _start_agent() -> dict:
@@ -284,29 +286,87 @@ def _stop_gateway() -> dict:
 
 
 def _send_to_agent(message: str) -> dict:
-    """Send message via hermes -m one-shot mode."""
-    import subprocess, sys, os, re as _re
+    """Send message directly to agent runtime — in-process, no subprocess.
+
+    Dashboard = agent runtime. Chat goes through run_conversation() directly
+    with all cognitive modules active (reasoning, verifier, etc).
+    Conversation history persists in-memory between messages.
+    """
+    global _agent_instance, _conversation_history
+    import sys, os
+
+    # Initialize agent on first call
+    if _agent_instance is None:
+        try:
+            os.environ["HERMES_YOLO_MODE"] = "1"
+            os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+
+            from hermes_cli.config import load_config
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            from hermes_cli.tools_config import _get_platform_tools
+            from hermes_cli.fallback_config import get_fallback_chain
+            from run_agent import AIAgent
+            from hermes_cli.oneshot import _oneshot_clarify_callback, _create_session_db_for_oneshot
+
+            cfg = load_config()
+            model_cfg = cfg.get("model") or {}
+            cfg_model = model_cfg.get("default") or model_cfg.get("model") or "" if isinstance(model_cfg, dict) else str(model_cfg)
+            env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
+            effective_model = env_model or cfg_model
+
+            cfg_provider = ""
+            if isinstance(model_cfg, dict):
+                cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            current_provider = cfg_provider or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
+
+            runtime = resolve_runtime_provider(
+                requested=current_provider,
+                target_model=effective_model or None,
+            )
+
+            toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+            session_db = _create_session_db_for_oneshot()
+            _fb = get_fallback_chain(cfg)
+
+            _agent_instance = AIAgent(
+                api_key=runtime.get("api_key"),
+                base_url=runtime.get("base_url"),
+                provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                model=effective_model,
+                enabled_toolsets=toolsets_list,
+                quiet_mode=True,
+                platform="cli",
+                session_db=session_db,
+                credential_pool=runtime.get("credential_pool"),
+                fallback_model=_fb or None,
+                clarify_callback=_oneshot_clarify_callback,
+            )
+            _agent_instance.suppress_status_output = True
+            _agent_instance.stream_delta_callback = None
+            _agent_instance.tool_gen_callback = None
+            _conversation_history = []
+        except Exception as exc:
+            return {"success": False, "error": f"Khong the khoi tao agent: {exc!r}"}
+
+    # Run conversation directly
     try:
-        env = {**os.environ, "HERMES_HOME": str(HERMES_HOME)}
-        proc = subprocess.run(
-            [sys.executable, "-m", "hermes_cli.main", "-m", message, "--yolo"],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(REPO_ROOT), env=env,
+        from agent.conversation_loop import run_conversation
+        result = run_conversation(
+            _agent_instance,
+            user_message=message,
+            conversation_history=_conversation_history,
         )
-        if proc.returncode == 0:
-            output = proc.stdout.strip()
-            output = _re.sub(r'\x1b\[[0-9;]*m', '', output)
-            lines = output.split("\n")
-            resp = [l for l in lines if not any(s in l for s in ["\u274c","\u2713","\u2192","\u2139","\u26a0"])]
-            response = "\n".join(resp).strip() or output[-2000:]
-            return {"success": True, "response": response}
-        else:
-            err = (proc.stderr or proc.stdout or "Unknown").strip()[-500:]
-            return {"success": False, "error": f"L\u1ed7i: {err}"}
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Agent h\u1ebft th\u1eddi gian (120s)"}
+        _conversation_history = result.get("messages", _conversation_history)
+        response = result.get("final_response", "")
+        if not response:
+            for msg in reversed(_conversation_history):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    response = msg["content"]
+                    break
+        return {"success": bool(response), "response": response or "(Agent khong tra loi)"}
     except Exception as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": f"Loi agent: {exc!r}"}
 
 
 # ─── Action handlers ────────────────────────────────────────────────────────
