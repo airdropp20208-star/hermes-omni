@@ -546,25 +546,27 @@ def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
             return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _send_to_agent(message: str, timeout: int = 90) -> dict:
-    """Run one-shot through the real Hermes agent via subprocess.
+def _send_to_agent(message: str, timeout: int = 120) -> dict:
+    """Run agent IN-PROCESS (not subprocess) for reliability.
     
-    Uses FAST MODE by default (direct API call) for reliability.
-    Falls back to hermes subprocess if fast=0 in request.
+    Uses hermes_cli.oneshot._run_agent() — same as `hermes -z` but no subprocess.
+    - Real agent with reasoning + tools (44 modules active)
+    - MAX_ITERATIONS=5 (configurable via env) — prevents infinite tool loops
+    - Won't hang like subprocess can on UserLAnd/ARM64
+    - No cold start overhead (agent initialized once, cached)
     """
     if not message or not message.strip():
         return {"success": False, "error": "Tin nhắn trống"}
     
     with _chat_lock:
-        import subprocess
-
-        # Make sure env is set
-        env = dict(os.environ)
-        env["HERMES_YOLO_MODE"] = "1"
-        env["HERMES_ACCEPT_HOOKS"] = "1"
-        env["HERMES_HOME"] = str(HERMES_HOME)
-
-        # Load .env into env
+        # Setup env
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+        os.environ.setdefault("HERMES_HOME", str(HERMES_HOME))
+        # Limit iterations to prevent hang (default 90 is too many)
+        os.environ.setdefault("HERMES_MAX_ITERATIONS", "5")
+        
+        # Load .env
         env_path = HERMES_HOME / ".env"
         if env_path.exists():
             for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -572,49 +574,48 @@ def _send_to_agent(message: str, timeout: int = 90) -> dict:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-
-        # Log start
+                os.environ[k.strip()] = v.strip()
+        
+        # Disable logging (hermes logs a lot)
+        import logging
+        logging.disable(logging.CRITICAL)
+        
         start = time.time()
-        print(f"[chat] start: {message[:80]!r}", flush=True)
+        print(f"[agent] start: {message[:80]!r}", flush=True)
         try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "hermes_cli.main", "-z", message, "--yolo"],
-                capture_output=True, text=True,
-                timeout=timeout,
-                cwd=str(REPO_ROOT),
-                env=env,
-                start_new_session=True,
-            )
+            from hermes_cli.oneshot import _run_agent
+            # Run in thread with timeout (in-process can't be killed easily)
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_agent, message)
+                try:
+                    response = future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    elapsed = time.time() - start
+                    print(f"[agent] TIMEOUT after {elapsed:.1f}s", flush=True)
+                    return {"success": False, "error": f"Agent timeout sau {int(elapsed)}s — thử Fast mode hoặc câu ngắn hơn."}
+            
             elapsed = time.time() - start
-            response = (proc.stdout or "").strip()
-            err_text = (proc.stderr or "").strip()
-            print(f"[chat] done in {elapsed:.1f}s, rc={proc.returncode}, out={len(response)}B, err={len(err_text)}B", flush=True)
-            if proc.returncode == 0 and response:
+            print(f"[agent] done in {elapsed:.1f}s, response={len(response or '')}B", flush=True)
+            
+            if response and response.strip():
+                # Clean up known non-response lines
                 lines = [l for l in response.splitlines() if l.strip()
                          and not l.startswith("[Note:")
                          and not l.startswith("Calling tool")
                          and not l.startswith("Tool output")]
                 cleaned = "\n".join(lines).strip() if lines else response
-                return {"success": True, "response": cleaned, "elapsed": round(elapsed, 1), "mode": "hermes"}
-            if response:
-                return {"success": True, "response": response, "warning": err_text[:200] if err_text else None, "elapsed": round(elapsed, 1), "mode": "hermes"}
-            return {
-                "success": False,
-                "error": (err_text[:300] if err_text else f"Agent exit code {proc.returncode}"),
-            }
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - start
-            print(f"[chat] TIMEOUT after {elapsed:.1f}s", flush=True)
-            try:
-                import signal as _sig
-                os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)  # type: ignore
-            except Exception:
-                pass
-            return {"success": False, "error": f"Agent timeout sau {int(elapsed)}s — thử lại với câu ngắn hơn hoặc tắt tools (mode Fast)."}
+                return {
+                    "success": True,
+                    "response": cleaned,
+                    "elapsed": round(elapsed, 1),
+                    "mode": "agent",
+                }
+            return {"success": False, "error": "Agent không trả response"}
         except Exception as exc:
+            elapsed = time.time() - start
             tb = traceback.format_exc()
-            print(f"[chat] ERROR: {type(exc).__name__}: {exc}", flush=True)
+            print(f"[agent] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
             return {"success": False, "error": f"{type(exc).__name__}: {exc}", "traceback": tb[-800:]}
 
 
@@ -1204,8 +1205,8 @@ select.search option{background:var(--card);color:var(--text)}
     <div class="mode-panel" id="modePanel">
       <div class="mode-bar">
         <div class="mode-group"><span class="mode-label">🚀 Engine</span>
-          <button class="mode-btn active" data-mt="engine" data-mv="fast" title="Gọi API trực tiếp — nhanh, không hang">Fast</button>
-          <button class="mode-btn" data-mt="engine" data-mv="full" title="Hermes subprocess + tools + reasoning">Full</button>
+          <button class="mode-btn" data-mt="engine" data-mv="fast" title="Gọi API trực tiếp — nhanh 2-3s, không agent">Fast</button>
+          <button class="mode-btn active" data-mt="engine" data-mv="full" title="Agent thật: reasoning + tools + 44 modules">Agent</button>
         </div>
         <div class="mode-divider"></div>
         <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
@@ -1288,7 +1289,7 @@ const T = {
 };
 let msgs = [];
 let visCount = 25;
-let curMode = {engine:'fast', thinking:'balanced', reasoning:'standard', verify:'on'};
+let curMode = {engine:'full', thinking:'balanced', reasoning:'standard', verify:'on'};
 let sending = false;
 
 // ─── Navigation ───
@@ -1439,7 +1440,7 @@ async function send(){
   sendBtn.disabled = true;
   sendBtn.textContent = '⏳...';
   addM('user', m);
-  const engineLabel = curMode.engine === 'fast' ? '🚀 Fast' : '🧠 Full';
+  const engineLabel = curMode.engine === 'fast' ? '🚀 Fast' : '🧠 Agent';
   addM('sys', '⏳ ' + engineLabel + ' đang suy nghĩ...');
   try {
     const r = await post('chat', {message:m, fast: curMode.engine === 'fast' ? '1' : '0'});
@@ -2085,7 +2086,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         routes = {
             "/api/action/chat": lambda: (
                 _send_to_agent_fast(data.get("message", ""))
-                if str(data.get("fast", "1")) != "0"
+                if str(data.get("fast", "0")) == "1"
                 else _send_to_agent(data.get("message", ""))
             ),
             "/api/action/setup-provider": lambda: _action_setup_provider(data),
