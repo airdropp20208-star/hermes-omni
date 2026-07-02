@@ -572,6 +572,51 @@ def _send_to_agent_fast(message: str, timeout: int = 45, thinking: bool = False)
 _fast_conversation_history = []  # separate history for fast mode
 
 
+def _pick_api_key(provider: str) -> tuple:
+    """Pick API key with rotation from multi_provider.yaml → fallback .env.
+    
+    Returns (api_key, source) where source is 'multi-provider' or 'env'.
+    Rotates round-robin across keys in multi_provider.yaml.
+    """
+    mp = _read_yaml(HERMES_HOME / "multi_provider.yaml")
+    providers = mp.get("providers", {}) if mp else {}
+    prov_cfg = providers.get(provider, {})
+    keys = prov_cfg.get("keys", [])
+    # Filter enabled keys
+    enabled_keys = []
+    for k in keys:
+        if isinstance(k, dict):
+            if k.get("enabled", True):
+                enabled_keys.append(k.get("key", ""))
+        elif isinstance(k, str):
+            enabled_keys.append(k)
+    enabled_keys = [k for k in enabled_keys if k and not k.startswith("your-")]
+    
+    if enabled_keys:
+        # Round-robin: use a counter file
+        counter_file = HERMES_HOME / ".key_counter"
+        idx = 0
+        try:
+            if counter_file.exists():
+                idx = int(counter_file.read_text().strip()) % len(enabled_keys)
+            counter_file.write_text(str((idx + 1) % len(enabled_keys)))
+        except Exception:
+            pass
+        return enabled_keys[idx], f"multi-provider ({len(enabled_keys)} keys, #{idx+1})"
+    
+    # Fallback: .env
+    env_path = HERMES_HOME / ".env"
+    key_var = PROVIDER_ENV_KEYS.get(provider, f"{provider.upper()}_API_KEY")
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith(f"{key_var}="):
+                v = line.split("=", 1)[1].strip()
+                if v and not v.startswith("your-"):
+                    return v, "env"
+    return "", "none"
+
+
 # ─── Cached AIAgent (3 modes: fast/thinking/max) ────────────────────────────
 
 _agent_cache: dict = {}  # mode → (agent, signature)
@@ -648,6 +693,13 @@ def _get_agent_for_mode(mode: str):
                 target_model=effective_model or None,
             )
 
+            # ─── Multi-provider: rotate API key from multi_provider.yaml ───
+            api_key = runtime.get("api_key")
+            picked_key, key_source = _pick_api_key(current_provider)
+            if picked_key:
+                api_key = picked_key
+                print(f"[agent-{mode}] api_key from {key_source}", flush=True)
+
             toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
             session_db = _create_session_db_for_oneshot()
             _fb = get_fallback_chain(cfg)
@@ -661,7 +713,7 @@ def _get_agent_for_mode(mode: str):
                 reasoning_config = {"enabled": True, "effort": "high"}
 
             agent = AIAgent(
-                api_key=runtime.get("api_key"),
+                api_key=api_key,  # rotated from multi_provider.yaml or runtime
                 base_url=runtime.get("base_url"),
                 provider=runtime.get("provider"),
                 api_mode=runtime.get("api_mode"),
@@ -721,12 +773,43 @@ def _send_to_agent(message: str, mode: str = "thinking", timeout: int = 600) -> 
             # Get conversation history for this mode
             history = _conversation_histories.setdefault(mode, [])
 
-            from agent.conversation_loop import run_conversation
-            result = run_conversation(
-                agent,
-                user_message=message,
-                conversation_history=history,
-            )
+            # ─── Skip cognitive modules for Fast mode (save 2-3 LLM calls) ───
+            # Fast mode = speed priority → skip verifier, constitution, smart_guardian
+            # Thinking/Max = full pipeline (44 modules active)
+            patched = False
+            orig_config_fn = None
+            if mode == "fast":
+                try:
+                    import agent.unified.integration as _integ
+                    from agent.unified.config import load_unified_config as _orig_load
+                    orig_config_fn = _integ.load_unified_config
+                    def _fast_config():
+                        c = _orig_load()
+                        c.verifier_enabled = False
+                        c.constitution_enabled = False
+                        c.smart_guardian_enabled = False
+                        return c
+                    _integ.load_unified_config = _fast_config
+                    patched = True
+                    print(f"[agent-fast] cognitive modules DISABLED (verifier/constitution/guardian)", flush=True)
+                except Exception:
+                    pass
+
+            try:
+                from agent.conversation_loop import run_conversation
+                result = run_conversation(
+                    agent,
+                    user_message=message,
+                    conversation_history=history,
+                )
+            finally:
+                # Restore config function
+                if patched and orig_config_fn is not None:
+                    try:
+                        _integ.load_unified_config = orig_config_fn
+                    except Exception:
+                        pass
+
             _conversation_histories[mode] = result.get("messages", history)
             response = result.get("final_response", "")
 
@@ -1492,20 +1575,18 @@ function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function fmtR(t){
   if(!t) return '';
   t = String(t);
-  // Detect JSON
+  // ─── FILTER: bỏ JSON blocks, todos, raw code — chỉ giữ text sạch ───
+  t = filterAgentOutput(t);
+  // Detect JSON (sau filter, chỉ hiển thị nếu CÒN lại)
   const trimmed = t.trim();
-  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-    try { return '<pre>'+esc(JSON.stringify(JSON.parse(trimmed),null,2))+'</pre>'; } catch(e) {}
-  }
+  if (!trimmed) return '<span style="color:var(--muted);font-style:italic">(agent đã xử lý — xem terminal để biết chi tiết)</span>';
   // Markdown-ish: code blocks with proper parsing
   if (t.includes('```')) {
     const parts = t.split('```');
     let html = esc(parts[0]);
     for (let i = 1; i < parts.length; i += 2) {
-      // parts[i] is code (may have lang prefix on first line), parts[i+1] is text after
       const codePart = parts[i] || '';
       const textAfter = parts[i+1] || '';
-      // Strip optional lang identifier from first line
       const code = codePart.replace(/^\w*\n/, '');
       html += '<pre>' + esc(code.replace(/\n$/, '')) + '</pre>';
       html += esc(textAfter);
@@ -1513,6 +1594,62 @@ function fmtR(t){
     return html.replace(/`([^`]+)`/g, '<code>$1</code>');
   }
   return esc(t).replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+// ─── Bộ lọc output agent ───
+// Bỏ: JSON blocks, TODO lists, raw tool output, markdown headers rác
+// Giữ: text tự nhiên, code blocks có ý nghĩa, danh sách ngắn
+function filterAgentOutput(t){
+  if(!t) return '';
+  t = String(t);
+  const lines = t.split('\n');
+  const out = [];
+  let inJsonBlock = false;
+  let braceCount = 0;
+  let inCodeBlock = false;
+  for (let line of lines) {
+    const trimmed = line.trim();
+    // Detect JSON block start (line starts with { or [ and looks like JSON)
+    if (!inCodeBlock && !inJsonBlock && (trimmed.startsWith('{') || trimmed.startsWith('[')) && trimmed.length > 2) {
+      // Check if it's a JSON block (multi-line)
+      if (trimmed.endsWith('{') || trimmed.endsWith('[') || (trimmed.startsWith('{') && !trimmed.endsWith('}'))) {
+        inJsonBlock = true;
+        braceCount += (trimmed.match(/[{\[]/g)||[]).length - (trimmed.match(/[}\]]/g)||[]).length;
+        continue; // skip this line
+      }
+    }
+    if (inJsonBlock) {
+      braceCount += (trimmed.match(/[{\[]/g)||[]).length - (trimmed.match(/[}\]]/g)||[]).length;
+      if (braceCount <= 0) {
+        inJsonBlock = false;
+      }
+      continue; // skip JSON lines
+    }
+    // Detect code block
+    if (trimmed.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      out.push(line); // keep code block markers
+      continue;
+    }
+    if (inCodeBlock) {
+      out.push(line);
+      continue;
+    }
+    // Skip TODO lines (agent internal planning)
+    if (/^\s*[-*]\s*\[[ xX]\]\s/.test(line)) continue; // - [ ] task
+    if (/^\s*TODO:?\s/i.test(line)) continue;
+    if (/^\s*\d+\.\s*\[[ xX]\]\s/.test(line)) continue; // 1. [ ] task
+    // Skip markdown headers that look like internal planning
+    if (/^#+\s*(TODO|PLAN|TASK|STEPS?|INTERNAL)/i.test(line)) continue;
+    // Skip "Calling tool" / "Tool output" lines
+    if (/^(Calling tool|Tool output|Tool result):/i.test(line)) continue;
+    // Skip empty "Note:" lines
+    if (/^\[Note:/.test(line)) continue;
+    out.push(line);
+  }
+  // Join and clean up multiple blank lines
+  let result = out.join('\n');
+  result = result.replace(/\n{3,}/g, '\n\n').trim();
+  return result;
 }
 function fn(n){n=+n||0;return n>1e6?(n/1e6).toFixed(1)+'M':n>1e3?(n/1e3).toFixed(0)+'K':String(n)}
 
