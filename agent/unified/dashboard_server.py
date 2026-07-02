@@ -739,17 +739,19 @@ def _get_agent_for_mode(mode: str):
             raise
 
 
-def _send_to_agent(message: str, mode: str = "thinking", timeout: int = 600) -> dict:
+def _send_to_agent(message: str, mode: str = "thinking", timeout: int = 600, stream_callback=None) -> dict:
     """Run agent IN-PROCESS with mode-specific reasoning config.
-    
+
     3 modes — ALL are real agents with tools + 44 modules:
     - fast: no reasoning (mimo enable_thinking=False) → 2-5s
-    - thinking: low reasoning → 10-20s  
+    - thinking: low reasoning → 10-20s
     - max: high reasoning → 30-60s
-    
+
     Agent cached per mode. Conversation history persists per mode.
     MAX_ITERATIONS=90 (full agent capability, no cap).
     Timeout 600s (10 min — enough for long tasks).
+
+    stream_callback: optional callable(token:str) — called with each text delta.
     """
     if not message or not message.strip():
         return {"success": False, "error": "Tin nhắn trống"}
@@ -797,13 +799,20 @@ def _send_to_agent(message: str, mode: str = "thinking", timeout: int = 600) -> 
 
             try:
                 from agent.conversation_loop import run_conversation
+                # Wire stream_callback if provided (for SSE streaming)
+                if stream_callback:
+                    agent.stream_delta_callback = stream_callback
                 result = run_conversation(
                     agent,
                     user_message=message,
                     conversation_history=history,
+                    stream_callback=stream_callback,
                 )
             finally:
-                # Restore config function
+                # Restore config function + clear callback
+                if stream_callback:
+                    try: agent.stream_delta_callback = None
+                    except: pass
                 if patched and orig_config_fn is not None:
                     try:
                         _integ.load_unified_config = orig_config_fn
@@ -1755,25 +1764,86 @@ async function send(){
   sendBtn.textContent = '⏳...';
   addM('user', m);
   const engineLabel = curMode.engine === 'fast' ? '⚡ Fast' : curMode.engine === 'thinking' ? '🧠 Thinking' : '🚀 Max';
-  addM('sys', '⏳ ' + engineLabel + ' đang suy nghĩ...');
+
+  // ─── SSE STREAMING: user sees tokens in real-time ───
+  // Add empty agent message that we'll fill with tokens
+  addM('agent', '');
+  const agentMsgIdx = msgs.length - 1;
+  let fullResponse = '';
+  let streamStarted = false;
+
   try {
-    const r = await post('chat', {message:m, engine: curMode.engine});
-    // remove the "thinking..." message
-    const last = msgs[msgs.length-1];
-    if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
-    if (r && r.success) {
-      addM('agent', r.response || '(Không có phản hồi)');
-      if (r.warning) addM('sys', '⚠ '+r.warning);
-      if (r.elapsed) addM('sys', '⏱ ' + r.elapsed + 's');
-    } else {
-      const err = r ? (r.error || 'Không có phản hồi') : 'Không có phản hồi';
-      addM('error', '❌ ' + esc(err));
-      if (err.includes('key') || err.includes('provider') || err.includes('API') || err.includes('No module')) {
-        addM('sys', '💡 Vào tab "Nhà cung cấp API" để cấu hình key');
+    const token = localStorage.getItem('hermes_token') || '';
+    const url = '/api/chat/stream?message=' + encodeURIComponent(m) + '&engine=' + curMode.engine;
+    const resp = await fetch(url, {headers: {'Authorization': 'Bearer ' + token}});
+    if (resp.status === 401) { showLogin(); return; }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let elapsed = 0, mode = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      // Parse SSE events (separated by \n\n)
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+      for (const evt of events) {
+        const dataLine = evt.split('\n').find(l => l.startsWith('data: '));
+        if (!dataLine) continue;
+        try {
+          const d = JSON.parse(dataLine.slice(6));
+          if (d.type === 'token') {
+            if (!streamStarted) {
+              // Remove "thinking..." message on first token
+              const last = msgs[msgs.length-1];
+              if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
+              // Re-add empty agent message (we removed it via pop if it was last)
+              if (msgs.length <= agentMsgIdx) addM('agent', '');
+              streamStarted = true;
+            }
+            fullResponse += d.text;
+            // Update agent message with streaming text
+            if (msgs[msgs.length-1] && msgs[msgs.length-1].t === 'agent') {
+              msgs[msgs.length-1].c = fullResponse;
+              render();
+            }
+          } else if (d.type === 'done') {
+            elapsed = d.elapsed;
+            mode = d.mode;
+            if (!fullResponse && d.response) fullResponse = d.response;
+          } else if (d.type === 'error') {
+            // Remove empty agent message
+            if (msgs[msgs.length-1] && msgs[msgs.length-1].t === 'agent' && !msgs[msgs.length-1].c) msgs.pop();
+            addM('error', '❌ ' + esc(d.error));
+          }
+        } catch(e) {}
       }
     }
+
+    // Finalize: if no streaming happened, fallback to non-stream
+    if (!streamStarted) {
+      // Remove empty agent message
+      if (msgs[msgs.length-1] && msgs[msgs.length-1].t === 'agent' && !fullResponse) msgs.pop();
+      // Fallback: use regular POST
+      const r = await post('chat', {message:m, engine: curMode.engine});
+      const last = msgs[msgs.length-1];
+      if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
+      if (r && r.success) {
+        addM('agent', r.response || '(Không có phản hồi)');
+        if (r.elapsed) addM('sys', '⏱ ' + r.elapsed + 's');
+      } else {
+        const err = r ? (r.error || 'Không có phản hồi') : 'Không có phản hồi';
+        addM('error', '❌ ' + esc(err));
+      }
+    } else {
+      if (elapsed) addM('sys', '⏱ ' + elapsed + 's · ' + (mode||''));
+    }
   } catch(e) {
-    // Network error mid-chat
+    // Network error
+    if (msgs[msgs.length-1] && msgs[msgs.length-1].t === 'agent' && !fullResponse) msgs.pop();
     const last = msgs[msgs.length-1];
     if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
     addM('error', '❌ Lỗi kết nối: ' + esc(e.message));
@@ -2359,6 +2429,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(_get_current_config())
             elif path == "/api/health":
                 self._send_json(_health_check())
+            elif path == "/api/chat/stream":
+                self._handle_sse_chat()
             elif path.startswith("/api/download/"):
                 self._serve_file(path[len("/api/download/"):])
             else:
@@ -2419,6 +2491,72 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "unknown action"}, 404)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # client gone
+
+    def _handle_sse_chat(self):
+        """SSE streaming chat — user sees tokens in real-time.
+
+        GET /api/chat/stream?message=...&engine=fast|thinking|max
+        Returns: text/event-stream with data: {type:token|done|error, ...}
+        """
+        # Auth check
+        if not self._check_security():
+            return
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            message = (qs.get("message", [""])[0] or "").strip()
+            mode = qs.get("engine", ["fast"])[0]
+            if not message:
+                self._send_json({"error": "message required"}, 400)
+                return
+            # SSE headers
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # Stream tokens
+            import queue
+            q = queue.Queue()
+            def on_token(token):
+                try: q.put(token, timeout=0.1)
+                except: pass
+            # Run agent in thread
+            import threading
+            def run():
+                try:
+                    result = _send_to_agent(message, mode=mode, stream_callback=on_token)
+                    q.put(("__done__", result))
+                except Exception as e:
+                    q.put(("__error__", str(e)))
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            # Send SSE events
+            while True:
+                try:
+                    item = q.get(timeout=600)
+                except Exception:
+                    break
+                if item == "__done__":
+                    result = q.get(timeout=1)
+                    data = json.dumps({"type": "done", "response": result.get("response",""), "elapsed": result.get("elapsed",0), "mode": result.get("mode","")}, ensure_ascii=False)
+                    self._safe_write(f"data: {data}\n\n".encode())
+                    break
+                elif isinstance(item, tuple) and item[0] == "__error__":
+                    data = json.dumps({"type": "error", "error": item[1]}, ensure_ascii=False)
+                    self._safe_write(f"data: {data}\n\n".encode())
+                    break
+                elif isinstance(item, str):
+                    data = json.dumps({"type": "token", "text": item}, ensure_ascii=False)
+                    self._safe_write(f"data: {data}\n\n".encode())
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:
+            try:
+                data = json.dumps({"type": "error", "error": str(e)}, ensure_ascii=False)
+                self._safe_write(f"data: {data}\n\n".encode())
+            except:
+                pass
 
     def _handle_upload(self):
         ct = self.headers.get("Content-Type", "")
