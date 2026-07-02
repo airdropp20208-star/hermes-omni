@@ -661,144 +661,357 @@ def _action_toggle_key(data: dict) -> dict:
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hermes-Omni</title>
+<title>Hermes-Omni · Bảng điều khiển</title>
 <style>
+:root{
+  --bg:#f5f0e8;--card:#faf6ef;--card-2:#ffffff;--border:#e0d5c3;--border-2:#c9bda6;
+  --text:#3d3528;--dim:#7a6f5c;--muted:#a89a82;
+  --accent:#c8860d;--accent-2:#b0770a;--accent-soft:rgba(200,134,13,.08);
+  --green:#5a8a3a;--green-soft:rgba(90,138,58,.12);
+  --red:#c44d4d;--red-soft:rgba(196,77,77,.12);
+  --blue:#4a7ba8;--blue-soft:rgba(74,123,168,.12);
+  --sidebar:#ede5d6;--hover:#e5dcc9;
+  --shadow-xs:0 1px 2px rgba(61,53,40,.04);
+  --shadow-sm:0 2px 6px rgba(61,53,40,.05);
+  --shadow-md:0 6px 18px rgba(61,53,40,.07);
+  --shadow-lg:0 16px 40px rgba(61,53,40,.09);
+  --r-sm:6px;--r:10px;--r-lg:14px;--r-xl:18px;
+  --mono:"SF Mono",ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#f5f0e8;--card:#faf6ef;--border:#e0d5c3;--text:#3d3528;--dim:#7a6f5c;--muted:#a89a82;--accent:#c8860d;--green:#5a8a3a;--red:#c44d4d;--blue:#4a7ba8;--sidebar:#ede5d6;--hover:#e5dcc9}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex}
-.sidebar{width:56px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:.8rem 0;gap:.3rem;position:sticky;top:0;height:100vh}
-.nav-btn{width:38px;height:38px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;cursor:pointer;border:none;background:none;color:var(--dim);transition:.15s}
-.nav-btn:hover{background:var(--hover);color:var(--text)}.nav-btn.active{background:var(--accent);color:#fff}
+html,body{height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"Helvetica Neue",sans-serif;
+  background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;
+  display:flex;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--border-2)}
+*{scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+
+/* ─── Sidebar ─── */
+.sidebar{
+  width:56px;background:var(--sidebar);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;align-items:center;
+  padding:10px 0 12px;gap:4px;position:sticky;top:0;height:100vh;
+  flex-shrink:0;z-index:10;
+}
+.logo{
+  width:38px;height:38px;border-radius:11px;
+  background:linear-gradient(135deg,#e0a030 0%,var(--accent) 100%);
+  color:#fff;display:flex;align-items:center;justify-content:center;
+  font-size:1.05rem;margin-bottom:8px;
+  box-shadow:0 4px 12px rgba(200,134,13,.35),inset 0 1px 0 rgba(255,255,255,.25);
+}
+.nav-btn{
+  width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;
+  font-size:1.05rem;cursor:pointer;border:none;background:transparent;color:var(--dim);
+  transition:background .18s ease,color .18s ease,transform .12s ease;
+}
+.nav-btn:hover{background:var(--hover);color:var(--text)}
+.nav-btn:active{transform:scale(.94)}
+.nav-btn.active{
+  background:var(--accent);color:#fff;
+  box-shadow:0 3px 10px rgba(200,134,13,.28),inset 0 1px 0 rgba(255,255,255,.18);
+}
 .nav-spacer{flex:1}
+.nav-btn.start{color:var(--green);background:var(--green-soft)}
+.nav-btn.start:hover{background:rgba(90,138,58,.22)}
+.nav-btn.stop{color:var(--red);background:var(--red-soft)}
+.nav-btn.stop:hover{background:rgba(196,77,77,.22)}
+
+/* ─── Main ─── */
 .main{flex:1;display:flex;flex-direction:column;min-width:0;height:100vh}
-.topbar{padding:.5rem .8rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:var(--card)}
-.topbar-title{font-weight:700;font-size:.9rem}.topbar-actions{display:flex;gap:.3rem;align-items:center}
-.badge{padding:.12rem .4rem;border-radius:9999px;font-size:.6rem;font-weight:600}
-.badge-g{background:rgba(90,138,58,.12);color:var(--green)}.badge-r{background:rgba(196,77,77,.12);color:var(--red)}
-.btn{padding:.35rem .7rem;border-radius:7px;font-size:.7rem;font-weight:600;cursor:pointer;border:none}
-.btn-p{background:var(--accent);color:#fff}.btn-g{background:var(--green);color:#fff}.btn-r{background:var(--red);color:#fff}.btn-h{background:var(--card);color:var(--dim);border:1px solid var(--border)}
-.view{display:none;flex:1;overflow-y:auto;padding:.8rem}.view.active{display:block}
-.chat-view{display:none;flex:1;flex-direction:column}.chat-view.active{display:flex}
-.chat-msgs{flex:1;overflow-y:auto;padding:.8rem;scroll-behavior:smooth}
-.chat-msgs::-webkit-scrollbar{width:5px}.chat-msgs::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.load-more{text-align:center;padding:.4rem;color:var(--accent);font-size:.7rem;cursor:pointer;margin-bottom:.3rem}
-.load-more:hover{text-decoration:underline}
-.msg{max-width:72%;margin-bottom:.6rem;padding:.6rem .9rem;border-radius:11px;font-size:.82rem;line-height:1.5;word-break:break-word;white-space:pre-wrap}
-.msg.user{background:var(--accent);color:#fff;margin-left:auto;border-bottom-right-radius:4px}
-.msg.agent{background:var(--card);border:1px solid var(--border);margin-right:auto;border-bottom-left-radius:4px}
-.msg.sys{background:transparent;color:var(--muted);font-size:.65rem;text-align:center;margin:0 auto;max-width:90%}
-.msg pre{background:rgba(0,0,0,.05);padding:.4rem;border-radius:5px;font-size:.75rem;margin-top:.3rem;overflow-x:auto}
-.chat-bottom{padding:.5rem .8rem;border-top:1px solid var(--border);background:var(--card)}
-.chat-input-row{display:flex;gap:.4rem;align-items:flex-end}
-.chat-input-row textarea{flex:1;padding:.4rem .6rem;border:1px solid var(--border);border-radius:9px;font-size:.82rem;background:var(--bg);color:var(--text);resize:none;font-family:inherit;max-height:100px}
-.chat-input-row textarea:focus{outline:none;border-color:var(--accent)}
-.file-area{padding:.2rem;border:1px dashed var(--border);border-radius:7px;text-align:center;font-size:.65rem;color:var(--muted);cursor:pointer;margin-bottom:.3rem}
-.file-area:hover{border-color:var(--accent)}.file-list{font-size:.6rem;color:var(--dim);margin-top:.15rem}
-/* Mode selector */
-.mode-bar{display:flex;gap:.3rem;align-items:center;padding:.3rem 0;border-top:1px solid var(--border);margin-top:.3rem;flex-wrap:wrap}
-.mode-group{display:flex;align-items:center;gap:.2rem}
-.mode-label{font-size:.6rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.03em}
-.mode-btn{padding:.2rem .5rem;border-radius:5px;font-size:.65rem;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--dim);transition:.15s}
+
+/* ─── Topbar ─── */
+.topbar{
+  padding:14px 22px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  background:var(--card);gap:12px;flex-shrink:0;
+}
+.topbar-title{font-weight:700;font-size:1.05rem;letter-spacing:-.01em}
+.topbar-actions{display:flex;gap:6px;align-items:center}
+.badge{
+  padding:4px 11px;border-radius:9999px;font-size:.68rem;font-weight:600;
+  letter-spacing:.02em;display:inline-flex;align-items:center;gap:4px;
+}
+.badge-g{background:var(--green-soft);color:var(--green)}
+.badge-r{background:var(--red-soft);color:var(--red)}
+.btn{
+  padding:8px 14px;border-radius:var(--r-sm);font-size:.76rem;font-weight:600;
+  cursor:pointer;border:none;transition:all .18s ease;font-family:inherit;
+  display:inline-flex;align-items:center;gap:5px;line-height:1;
+}
+.btn-p{background:var(--accent);color:#fff;box-shadow:0 2px 6px rgba(200,134,13,.25)}
+.btn-p:hover{background:var(--accent-2);box-shadow:0 4px 12px rgba(200,134,13,.32)}
+.btn-g{background:var(--green);color:#fff}
+.btn-g:hover{background:#4d7a30}
+.btn-r{background:var(--red);color:#fff}
+.btn-r:hover{background:#b04040}
+.btn-h{background:var(--card);color:var(--dim);border:1px solid var(--border)}
+.btn-h:hover{background:var(--hover);color:var(--text);border-color:var(--border-2)}
+
+/* ─── Views ─── */
+.view{display:none;flex:1;overflow-y:auto;padding:22px}
+.view.active{display:block}
+.chat-view{display:none;flex:1;flex-direction:column;min-height:0}
+.chat-view.active{display:flex}
+
+/* ─── Chat messages ─── */
+.chat-msgs{flex:1;overflow-y:auto;padding:22px 22px 8px;scroll-behavior:smooth}
+.load-more{
+  text-align:center;padding:8px 12px;color:var(--accent);font-size:.72rem;
+  cursor:pointer;margin-bottom:14px;font-weight:600;
+  border:1px solid transparent;border-radius:var(--r-sm);transition:all .15s ease;
+}
+.load-more:hover{text-decoration:underline;background:var(--accent-soft);border-color:var(--border)}
+.msg{
+  max-width:72%;margin-bottom:14px;padding:11px 15px;border-radius:14px;
+  font-size:.85rem;line-height:1.55;word-break:break-word;white-space:pre-wrap;
+  animation:msgIn .22s ease;
+}
+@keyframes msgIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.msg.user{
+  background:linear-gradient(135deg,#d49615 0%,var(--accent) 100%);color:#fff;
+  margin-left:auto;border-bottom-right-radius:4px;
+  box-shadow:0 4px 14px rgba(200,134,13,.22);
+}
+.msg.agent{
+  background:var(--card);border:1px solid var(--border);margin-right:auto;
+  border-bottom-left-radius:4px;box-shadow:var(--shadow-xs);
+}
+.msg.sys{
+  background:transparent;color:var(--muted);font-size:.7rem;text-align:center;
+  margin:0 auto;max-width:90%;padding:6px;font-style:italic;
+}
+.msg pre{
+  background:rgba(61,53,40,.06);padding:10px 12px;border-radius:var(--r-sm);
+  font-size:.78rem;margin-top:8px;overflow-x:auto;
+  font-family:var(--mono);color:var(--text);line-height:1.5;
+}
+.msg code{
+  background:rgba(61,53,40,.06);padding:2px 5px;border-radius:4px;
+  font-family:var(--mono);font-size:.85em;
+}
+.msg.agent pre{background:#2d2620;color:#f0e8d8;border:1px solid #3d3528}
+
+/* ─── Chat bottom ─── */
+.chat-bottom{padding:12px 22px 16px;border-top:1px solid var(--border);background:var(--card);flex-shrink:0}
+.file-area{
+  padding:11px;border:1.5px dashed var(--border-2);border-radius:var(--r);
+  text-align:center;font-size:.72rem;color:var(--muted);cursor:pointer;
+  margin-bottom:10px;transition:all .18s ease;background:rgba(245,240,232,.5);
+}
+.file-area:hover{border-color:var(--accent);background:var(--accent-soft);color:var(--accent-2)}
+.file-list{font-size:.7rem;color:var(--dim);margin-top:4px;margin-bottom:8px;font-family:var(--mono)}
+.mode-bar{
+  display:flex;gap:10px;align-items:center;padding:10px 0 8px;
+  border-top:1px solid var(--border);margin-top:6px;flex-wrap:wrap;
+}
+.mode-group{display:flex;align-items:center;gap:4px}
+.mode-label{
+  font-size:.62rem;color:var(--muted);font-weight:700;text-transform:uppercase;
+  letter-spacing:.04em;margin-right:4px;
+}
+.mode-btn{
+  padding:4px 10px;border-radius:var(--r-sm);font-size:.68rem;font-weight:600;
+  cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--dim);
+  transition:all .15s ease;font-family:inherit;
+}
 .mode-btn:hover{border-color:var(--accent);color:var(--text)}
-.mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-.mode-divider{width:1px;height:16px;background:var(--border);margin:0 .2rem}
-.mode-info{font-size:.55rem;color:var(--muted);margin-left:auto}
-.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:.6rem;margin-bottom:.8rem}
-.sc{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:.8rem}
-.sl{font-size:.6rem;text-transform:uppercase;color:var(--muted);font-weight:600}.sv{font-size:1.3rem;font-weight:800;margin:.15rem 0}.ss{font-size:.65rem;color:var(--dim)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:.8rem;margin-bottom:.6rem}
-.pc{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:.8rem;margin-bottom:.5rem}
-.kr{display:flex;align-items:center;gap:.3rem;padding:.25rem;border-radius:5px;background:var(--bg);margin-bottom:.15rem}
-.kp{font-family:monospace;font-size:.65rem;color:var(--dim);min-width:90px}
-.qb{flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden}
-.qf{height:100%;border-radius:2px}.qf.g{background:var(--green)}.qf.y{background:#d4a017}.qf.r{background:var(--red)}
-.ks{font-size:.55rem;padding:.06rem .25rem;border-radius:3px;font-weight:600}
-.ks.active{background:rgba(90,138,58,.12);color:var(--green)}.ks.exhausted{background:rgba(196,77,77,.12);color:var(--red)}.ks.disabled{background:rgba(153,153,153,.12);color:var(--muted)}
-.mb{display:inline-block;background:rgba(200,134,13,.08);color:var(--accent);padding:.06rem .3rem;border-radius:3px;font-size:.55rem;font-family:monospace;margin-right:.1rem}
-.cf{display:flex;align-items:center;justify-content:space-between;padding:.35rem .5rem;border-radius:5px;background:var(--card);margin-bottom:.1rem}
-.cf:hover{background:var(--hover)}.cfp{font-family:monospace;font-size:.6rem;color:var(--muted)}.cfd{font-size:.68rem;color:var(--dim)}
-.tg{width:32px;height:16px;background:var(--border);border-radius:8px;cursor:pointer;position:relative;transition:.2s;flex-shrink:0}
-.tg.on{background:var(--green)}.tg::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;background:#fff;border-radius:50%;transition:.2s}.tg.on::after{left:18px}
-.sk-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.5rem}
-.skc{background:var(--card);border:1px solid var(--border);border-radius:7px;padding:.7rem}
-.skn{font-weight:700;font-size:.72rem}.skr{font-size:.55rem;color:var(--muted);font-family:monospace}.skde{font-size:.68rem;color:var(--dim);margin:.15rem 0}
-.json-in{width:100%;height:70px;padding:.4rem;border:1px solid var(--border);border-radius:7px;font-family:monospace;font-size:.7rem;background:var(--card);color:var(--text);resize:vertical}
-.json-out{padding:.4rem;border:1px solid var(--border);border-radius:7px;background:var(--card);font-family:monospace;font-size:.7rem;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto;margin-top:.3rem}
-.search{width:100%;padding:.35rem .5rem;border:1px solid var(--border);border-radius:7px;font-size:.75rem;background:var(--card);color:var(--text);margin-bottom:.4rem}
-.search:focus{outline:none;border-color:var(--accent)}
-@media(max-width:768px){body{flex-direction:column}.sidebar{width:100%;height:auto;flex-direction:row;position:sticky;top:0;border-right:none;border-bottom:1px solid var(--border);padding:.4rem;gap:.2rem}.nav-spacer{display:none}.main{height:calc(100vh - 52px)}}
-</style></head><body>
+.mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent);box-shadow:0 2px 6px rgba(200,134,13,.25)}
+.mode-divider{width:1px;height:18px;background:var(--border);margin:0 4px}
+.mode-info{font-size:.62rem;color:var(--muted);margin-left:auto;font-family:var(--mono);font-weight:600}
+.chat-input-row{display:flex;gap:8px;align-items:flex-end;margin-top:8px}
+.chat-input-row textarea{
+  flex:1;padding:11px 14px;border:1px solid var(--border);border-radius:var(--r);
+  font-size:.85rem;background:var(--bg);color:var(--text);resize:none;
+  font-family:inherit;line-height:1.5;max-height:120px;transition:all .15s ease;
+}
+.chat-input-row textarea:focus{outline:none;border-color:var(--accent);background:var(--card-2);box-shadow:0 0 0 3px var(--accent-soft)}
+.chat-input-row .btn{padding:11px 20px;font-size:.8rem}
+
+/* ─── Overview stat grid ─── */
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-bottom:16px}
+.sc{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+  padding:18px 18px 16px;box-shadow:var(--shadow-xs);transition:all .2s ease;
+  position:relative;overflow:hidden;
+}
+.sc::before{
+  content:"";position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,var(--accent),#e0a030);opacity:.7;
+}
+.sc:hover{box-shadow:var(--shadow-md);transform:translateY(-2px);border-color:var(--border-2)}
+.sl{font-size:.68rem;text-transform:uppercase;color:var(--muted);font-weight:700;letter-spacing:.06em}
+.sv{font-size:1.85rem;font-weight:800;margin:8px 0 2px;color:var(--text);letter-spacing:-.02em;line-height:1.1}
+.ss{font-size:.72rem;color:var(--dim)}
+
+/* ─── Cards ─── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px;margin-bottom:12px;box-shadow:var(--shadow-xs)}
+
+/* ─── Provider cards ─── */
+.pc{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px;margin-bottom:12px;box-shadow:var(--shadow-xs);transition:border-color .15s ease}
+.pc:hover{border-color:var(--border-2)}
+.kr{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:var(--r-sm);background:var(--bg);margin-bottom:5px}
+.kp{font-family:var(--mono);font-size:.68rem;color:var(--dim);min-width:110px;font-weight:600}
+.qb{flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden}
+.qf{height:100%;border-radius:3px;transition:width .3s ease}
+.qf.g{background:var(--green)} .qf.y{background:#d4a017} .qf.r{background:var(--red)}
+.ks{font-size:.58rem;padding:2px 7px;border-radius:4px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;min-width:64px;text-align:center}
+.ks.active{background:var(--green-soft);color:var(--green)}
+.ks.exhausted{background:var(--red-soft);color:var(--red)}
+.ks.disabled{background:rgba(153,153,153,.15);color:var(--muted)}
+.mb{display:inline-block;background:var(--accent-soft);color:var(--accent);padding:2px 8px;border-radius:4px;font-size:.6rem;font-family:var(--mono);margin:0 4px 4px 0;font-weight:600}
+
+/* ─── Config ─── */
+.cf{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-radius:var(--r-sm);background:var(--card);margin-bottom:4px;transition:background .15s ease;border:1px solid transparent}
+.cf:hover{background:var(--hover);border-color:var(--border)}
+.cfp{font-family:var(--mono);font-size:.66rem;color:var(--muted)}
+.cfd{font-size:.76rem;color:var(--dim);margin-top:3px}
+.tg{width:38px;height:21px;background:var(--border-2);border-radius:11px;cursor:pointer;position:relative;transition:background .2s ease;flex-shrink:0}
+.tg.on{background:var(--green)}
+.tg::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;background:#fff;border-radius:50%;transition:left .2s ease;box-shadow:0 1px 3px rgba(0,0,0,.18)}
+.tg.on::after{left:19px}
+
+/* ─── Skills grid ─── */
+.sk-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px}
+.skc{background:var(--card);border:1px solid var(--border);border-radius:var(--r-sm);padding:12px 14px;transition:all .15s ease}
+.skc:hover{border-color:var(--border-2);box-shadow:var(--shadow-xs)}
+.skn{font-weight:700;font-size:.76rem}
+.skr{font-size:.58rem;color:var(--muted);font-family:var(--mono)}
+.skde{font-size:.72rem;color:var(--dim);margin:4px 0 2px}
+
+/* ─── JSON / Search ─── */
+.json-in{width:100%;height:80px;padding:10px;border:1px solid var(--border);border-radius:var(--r-sm);font-family:var(--mono);font-size:.72rem;background:var(--bg);color:var(--text);resize:vertical}
+.json-in:focus{outline:none;border-color:var(--accent)}
+.json-out{padding:10px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);font-family:var(--mono);font-size:.72rem;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow-y:auto;margin-top:8px}
+.search{width:100%;padding:9px 13px;border:1px solid var(--border);border-radius:var(--r-sm);font-size:.8rem;background:var(--card);color:var(--text);margin-bottom:10px;font-family:inherit;transition:all .15s ease}
+.search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+select.search{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a6f5c' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");background-repeat:no-repeat;background-position:right 10px center;background-size:14px;padding-right:32px}
+select.search option{background:var(--card);color:var(--text)}
+
+/* ─── Section headers ─── */
+.section-title{font-weight:700;font-size:.92rem;margin-bottom:4px;letter-spacing:-.01em}
+.section-sub{font-size:.74rem;color:var(--muted);margin-bottom:14px}
+.cfg-cat{font-weight:700;color:var(--accent);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+
+/* ─── Mobile ─── */
+@media(max-width:768px){
+  body{flex-direction:column}
+  .sidebar{width:100%;height:auto;flex-direction:row;position:sticky;top:0;border-right:none;border-bottom:1px solid var(--border);padding:6px 10px;gap:3px;overflow-x:auto;background:rgba(237,229,214,.97);backdrop-filter:blur(10px)}
+  .logo{margin-bottom:0;margin-right:6px;flex-shrink:0;width:34px;height:34px;font-size:.95rem}
+  .nav-spacer{display:none}
+  .nav-btn{width:36px;height:36px;flex-shrink:0}
+  .main{height:calc(100vh - 50px)}
+  .msg{max-width:88%}
+  .sg{grid-template-columns:1fr 1fr;gap:8px}
+  .sc{padding:14px}
+  .sv{font-size:1.4rem}
+  .chat-msgs{padding:14px}
+  .chat-bottom{padding:10px 14px 12px}
+  .topbar{padding:10px 14px}
+  .topbar-title{font-size:.95rem}
+  .mode-bar{gap:6px}
+  .mode-divider{display:none}
+  .view{padding:14px}
+}
+</style></head>
+<body>
 <nav class="sidebar">
-<button class="nav-btn active" onclick="nv(event,'chat')" title="Trò chuyện">💬</button>
-<button class="nav-btn" onclick="nv(event,'overview')" title="Tổng quan">📊</button>
-<button class="nav-btn" onclick="nv(event,'providers')" title="Nhà cung cấp API">🔌</button>
-<button class="nav-btn" onclick="nv(event,'config')" title="Cấu hình tính năng">⚙️</button>
-<button class="nav-btn" onclick="nv(event,'costs')" title="Thống kê chi phí">💰</button>
-<button class="nav-btn" onclick="nv(event,'logs')" title="Nhật ký hoạt động">📋</button>
-<div class="nav-spacer"></div>
-<button class="nav-btn" onclick="startAgent()" title="Start" style="color:var(--green)">▶</button>
-<button class="nav-btn" onclick="stopAgent()" title="Stop" style="color:var(--red)">⏹</button>
+  <div class="logo">⚡</div>
+  <button class="nav-btn active" onclick="nv(event,'chat')" title="Trò chuyện">💬</button>
+  <button class="nav-btn" onclick="nv(event,'overview')" title="Tổng quan">📊</button>
+  <button class="nav-btn" onclick="nv(event,'providers')" title="Nhà cung cấp API">🔌</button>
+  <button class="nav-btn" onclick="nv(event,'config')" title="Cấu hình tính năng">⚙️</button>
+  <button class="nav-btn" onclick="nv(event,'costs')" title="Thống kê chi phí">💰</button>
+  <button class="nav-btn" onclick="nv(event,'logs')" title="Nhật ký hoạt động">📋</button>
+  <div class="nav-spacer"></div>
+  <button class="nav-btn start" onclick="startAgent()" title="Khởi động agent">▶</button>
+  <button class="nav-btn stop" onclick="stopAgent()" title="Dừng agent">⏹</button>
 </nav>
 <div class="main">
 <div class="topbar"><div class="topbar-title" id="vt">Trò chuyện</div><div class="topbar-actions">
 <span class="badge badge-g" id="as">● Agent</span><span class="badge badge-r" id="gs">GW: Off</span>
-<button class="btn btn-h" onclick="startGW()" style="font-size:.6rem">Bật Gateway</button></div></div>
-<div id="chat" class="chat-view active"><div class="chat-msgs" id="cm"><div class="msg sys">💬 Trò chuyện với Hermes. Agent tự khởi động khi bật bảng điều khiển.</div></div>
-<div class="chat-bottom"><div class="file-area" id="fa" onclick="document.getElementById('fi').click()">📎 Kéo thả hoặc click<input type="file" id="fi" multiple style="display:none" onchange="upF(this.files)"></div><div class="file-list" id="fl"></div>
-<div class="mode-bar">
-<div class="mode-group"><span class="mode-label">🧠 Thinking</span>
-<button class="mode-btn" onclick="setMode('thinking','fast',this)">Fast</button>
-<button class="mode-btn active" onclick="setMode('thinking','balanced',this)">Balanced</button>
-<button class="mode-btn" onclick="setMode('thinking','deep',this)">Deep</button>
-<button class="mode-btn" onclick="setMode('thinking','max',this)">Max</button>
-</div>
-<div class="mode-divider"></div>
-<div class="mode-group"><span class="mode-label">⚡ Reasoning</span>
-<button class="mode-btn" onclick="setMode('reasoning','off',this)">Off</button>
-<button class="mode-btn active" onclick="setMode('reasoning','standard',this)">Std</button>
-<button class="mode-btn" onclick="setMode('reasoning','high',this)">High</button>
-<button class="mode-btn" onclick="setMode('reasoning','max',this)">Max</button>
-</div>
-<div class="mode-divider"></div>
-<div class="mode-group"><span class="mode-label">🛡️ Verify</span>
-<button class="mode-btn" onclick="setMode('verify','off',this)">Off</button>
-<button class="mode-btn active" onclick="setMode('verify','on',this)">On</button>
-</div>
-<span class="mode-info" id="mode-info">balanced · std · verify</span>
-</div>
-<div class="chat-input-row" style="margin-top:.2rem"><textarea id="ci" placeholder="Nhập tin nhắn..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea><button class="btn btn-p" onclick="send()">Gửi</button></div></div></div>
-<div id="overview" class="view"><div class="sg" id="sc"></div></div>
-<div id="providers" class="view"><div id="pl"></div>
-<div class="card" style="margin-top:.5rem">
-<b>🔑 Thiết lập API Key</b><br><span style="font-size:.7rem;color:var(--muted)">Cấu hình nhà cung cấp AI cho agent</span><br><br>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
-<select id="sp-provider" class="search" style="margin:0">
-<option value="">Chọn nhà cung cấp...</option>
-<option value="zai">GLM (z.ai) — Miễn phí</option>
-<option value="xiaomi">Xiaomi MiMo</option>
-<option value="openai">OpenAI (GPT)</option>
-<option value="anthropic">Anthropic (Claude)</option>
-<option value="openrouter">OpenRouter (nhiều model)</option>
-<option value="deepseek">DeepSeek</option>
-<option value="custom">Tùy chỉnh</option>
-</select>
-<input id="sp-model" class="search" style="margin:0" placeholder="Model (vd: glm-4.6)">
-<input id="sp-baseurl" class="search" style="margin:0" placeholder="Base URL (vd: https://open.bigmodel.cn/api/paas/v4)">
-<input id="sp-apikey" class="search" style="margin:0" type="password" placeholder="API Key">
-</div>
-<div style="display:flex;gap:.3rem;margin-top:.4rem">
-<button class="btn btn-p" onclick="setupProvider()">💾 Lưu cấu hình</button>
-<button class="btn btn-h" onclick="testKey()">🧪 Kiểm tra key</button>
-</div>
-<div id="sp-result" style="font-size:.7rem;margin-top:.3rem;color:var(--dim)"></div>
-</div>
-<button class="btn btn-h" onclick="addP()" style="margin-top:.5rem">+ Thêm nhà cung cấp (nhiều key)</button>
-</div>
-<div id="config" class="view"><input class="search" placeholder="🔍 Tìm..." onkeyup="fc(this.value)"><div id="cl"></div></div>
-<div id="costs" class="view"><div id="cs"></div></div>
-<div id="logs" class="view"><div class="card" style="max-height:400px;overflow:auto" id="lf"></div></div>
+<button class="btn btn-h" onclick="startGW()">Bật Gateway</button></div></div>
 
-</div></div>
+<div id="chat" class="chat-view active">
+  <div class="chat-msgs" id="cm"><div class="msg sys">💬 Trò chuyện với Hermes. Agent tự khởi động khi bật bảng điều khiển.</div></div>
+  <div class="chat-bottom">
+    <div class="file-area" id="fa" onclick="document.getElementById('fi').click()">📎 Kéo thả tệp hoặc nhấn để chọn<input type="file" id="fi" multiple style="display:none" onchange="upF(this.files)"></div>
+    <div class="file-list" id="fl"></div>
+    <div class="mode-bar">
+      <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
+        <button class="mode-btn" onclick="setMode('thinking','fast',this)">Fast</button>
+        <button class="mode-btn active" onclick="setMode('thinking','balanced',this)">Balanced</button>
+        <button class="mode-btn" onclick="setMode('thinking','deep',this)">Deep</button>
+        <button class="mode-btn" onclick="setMode('thinking','max',this)">Max</button>
+      </div>
+      <div class="mode-divider"></div>
+      <div class="mode-group"><span class="mode-label">⚡ Reasoning</span>
+        <button class="mode-btn" onclick="setMode('reasoning','off',this)">Off</button>
+        <button class="mode-btn active" onclick="setMode('reasoning','standard',this)">Std</button>
+        <button class="mode-btn" onclick="setMode('reasoning','high',this)">High</button>
+        <button class="mode-btn" onclick="setMode('reasoning','max',this)">Max</button>
+      </div>
+      <div class="mode-divider"></div>
+      <div class="mode-group"><span class="mode-label">🛡️ Verify</span>
+        <button class="mode-btn" onclick="setMode('verify','off',this)">Off</button>
+        <button class="mode-btn active" onclick="setMode('verify','on',this)">On</button>
+      </div>
+      <span class="mode-info" id="mode-info">balanced · std · verify</span>
+    </div>
+    <div class="chat-input-row">
+      <textarea id="ci" placeholder="Nhập tin nhắn cho Hermes..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea>
+      <button class="btn btn-p" onclick="send()">Gửi ➤</button>
+    </div>
+  </div>
+</div>
+
+<div id="overview" class="view"><div class="sg" id="sc"></div></div>
+
+<div id="providers" class="view">
+  <div id="pl"></div>
+  <div class="card" style="margin-top:10px">
+    <div class="section-title">🔑 Thiết lập API Key</div>
+    <div class="section-sub">Cấu hình nhà cung cấp AI cho agent</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <select id="sp-provider" class="search" style="margin:0">
+        <option value="">Chọn nhà cung cấp...</option>
+        <option value="zai">GLM (z.ai) — Miễn phí</option>
+        <option value="xiaomi">Xiaomi MiMo</option>
+        <option value="openai">OpenAI (GPT)</option>
+        <option value="anthropic">Anthropic (Claude)</option>
+        <option value="openrouter">OpenRouter (nhiều model)</option>
+        <option value="deepseek">DeepSeek</option>
+        <option value="custom">Tùy chỉnh</option>
+      </select>
+      <input id="sp-model" class="search" style="margin:0" placeholder="Model (vd: glm-4.6)">
+      <input id="sp-baseurl" class="search" style="margin:0" placeholder="Base URL (vd: https://open.bigmodel.cn/api/paas/v4)">
+      <input id="sp-apikey" class="search" style="margin:0" type="password" placeholder="API Key">
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-p" onclick="setupProvider()">💾 Lưu cấu hình</button>
+      <button class="btn btn-h" onclick="testKey()">🧪 Kiểm tra key</button>
+    </div>
+    <div id="sp-result" style="font-size:.74rem;margin-top:10px;color:var(--dim);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);min-height:18px"></div>
+  </div>
+  <button class="btn btn-h" onclick="addP()" style="margin-top:8px">+ Thêm nhà cung cấp (nhiều key)</button>
+</div>
+
+<div id="config" class="view">
+  <input class="search" placeholder="🔍 Tìm cấu hình..." onkeyup="fc(this.value)">
+  <div id="cl"></div>
+</div>
+
+<div id="costs" class="view"><div id="cs"></div></div>
+
+<div id="logs" class="view"><div class="card" style="max-height:520px;overflow:auto" id="lf"></div></div>
+
+</div>
+
 <script>
 const T={chat:'Trò chuyện',overview:'Tổng quan',providers:'Nhà cung cấp API',config:'Cấu hình',costs:'Chi phí',logs:'Nhật ký hoạt động'};
 let msgs=[],cnt=25;
