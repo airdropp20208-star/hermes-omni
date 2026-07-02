@@ -101,9 +101,13 @@ def _get_current_config() -> dict:
     api_key = ""
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
-            if "_API_KEY=" in line:
+            line = line.strip()
+            if line.startswith("#") or not line:
+                continue
+            if "_API_KEY=" in line and "=" in line:
                 api_key = line.split("=", 1)[1].strip()
-                break
+                if api_key and not api_key.startswith("your-"):
+                    break
     return {
         "provider": model_cfg.get("provider", ""),
         "model": model_cfg.get("default", ""),
@@ -347,7 +351,7 @@ def _send_to_agent(message: str) -> dict:
             _agent_instance.tool_gen_callback = None
             _conversation_history = []
         except Exception as exc:
-            return {"success": False, "error": f"Khong the khoi tao agent: {exc!r}"}
+            return {"success": False, "error": "Khong the khoi tao agent: " + repr(exc) + ". Vao tab Nha cung cap de setup API key."}
 
     # Run conversation directly
     try:
@@ -366,7 +370,7 @@ def _send_to_agent(message: str) -> dict:
                     break
         return {"success": bool(response), "response": response or "(Agent khong tra loi)"}
     except Exception as exc:
-        return {"success": False, "error": f"Loi agent: {exc!r}"}
+        return {"success": False, "error": "Loi agent: " + repr(exc)}
 
 
 # ─── Action handlers ────────────────────────────────────────────────────────
@@ -1023,12 +1027,12 @@ function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g
 function fmtR(t){if(!t)return'';try{return'<pre>'+esc(JSON.stringify(JSON.parse(t),null,2))+'</pre>'}catch(e){return esc(t)}}
 function render(){const c=document.getElementById('cm');const v=msgs.slice(-cnt);let h='';if(msgs.length>cnt)h+='<div class="load-more" onclick="cnt+=20;render()">↑ Tải cũ hơn ('+(msgs.length-cnt)+')</div>';v.forEach(m=>h+='<div class="msg '+m.t+'">'+m.c+'</div>');c.innerHTML=h;c.scrollTop=c.scrollHeight}
 function addM(t,c){msgs.push({t,c});render()}
-async function send(){const i=document.getElementById('ci');const m=i.value.trim();if(!m)return;i.value='';i.style.height='auto';addM('user',esc(m));addM('sys','⏳...');const r=await post('chat',{message:m});const sm=document.querySelectorAll('.msg.sys');if(sm.length)sm[sm.length-1].remove();if(r&&r.success)addM('agent',fmtR(r.response));else addM('sys','❌ '+(r?r.error:'No response'))}
+async function send(){const i=document.getElementById('ci');const m=i.value.trim();if(!m)return;i.value='';i.style.height='auto';addM('user',esc(m));addM('sys','⏳...');const r=await post('chat',{message:m});const sm=document.querySelectorAll('.msg.sys');if(sm.length)sm[sm.length-1].remove();if(r&&r.success)addM('agent',fmtR(r.response));else{const e=r?r.error:'Khong co phan hoi';addM('sys','❌ '+e);if(e.includes('key')||e.includes('provider')||e.includes('API'))addM('sys','💡 Vao tab Nha cung cap de setup API key')}}
 async function upF(fs){const fl=document.getElementById('fl');for(const f of fs){const fd=new FormData();fd.append('file',f);try{const r=await fetch('/api/upload',{method:'POST',body:fd});const res=await r.json();if(res.success){fl.innerHTML+='✓ '+f.name+'<br>';addM('sys','📎 '+f.name)}else fl.innerHTML+='❌ '+f.name+'<br>'}catch(e){fl.innerHTML+='❌<br>'}}}
 const fa=document.getElementById('fa');fa.ondragover=e=>{e.preventDefault();fa.style.borderColor='var(--accent)'};fa.ondragleave=()=>fa.style.borderColor='';fa.ondrop=e=>{e.preventDefault();fa.style.borderColor='';upF(e.dataTransfer.files)};
 function fj(){const v=document.getElementById('ji').value.trim(),f=document.getElementById('jf').value.trim(),o=document.getElementById('jo');if(!v){o.textContent='Kết quả...';return}try{let j=JSON.parse(v);if(f){if(j[f]!==undefined)j=j[f];else{const n={};for(const[k,v2]of Object.entries(j))if(k.includes(f))n[k]=v2;j=Object.keys(n).length?n:j}}o.innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>'}catch(e){o.textContent='❌ '+e.message}}
 async function api(p){try{return await(await fetch('/api/'+p)).json()}catch(e){return null}}
-async function post(a,d){try{return await api('action/'+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})})}catch(e){return null}}
+async function post(a,d){try{const r=await fetch('/api/action/'+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});if(!r.ok){try{const e=await r.json();return e}catch(_){return{success:false,error:'HTTP '+r.status}}}return await r.json()}catch(e){return{success:false,error:'Loi ket noi: '+e.message}}}
 function fn(n){return n>1e6?(n/1e6).toFixed(1)+'M':n>1e3?(n/1e3).toFixed(0)+'K':n}
 async function ca(){const s=await api('agent-status');const e=document.getElementById('as');if(s&&s.running){e.className='badge badge-g';e.textContent='● PID:'+s.pid}else{e.className='badge badge-r';e.textContent='● Off'}}
 async function startAgent(){const r=await post('start-agent');if(r&&r.success){addM('sys','🟢 '+r.message);ca()}else addM('sys','❌ '+(r?r.error:'Fail'))}
