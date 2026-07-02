@@ -2,11 +2,13 @@
 
 Architecture:
 - HTTP server (ThreadingHTTPServer) on port 8788
-- Chat via run_oneshot() from hermes_cli.oneshot (in-process, real agent)
-- All tabs working: Chat, Overview, Providers, Config, Costs, Logs, Skills
+- Chat via subprocess `hermes -z` (isolated, won't crash server)
+- All tabs working: Chat, Overview, Providers, Config, Skills, Costs, Logs
 - Provider setup writes config.yaml + .env (same format as `hermes model`)
 - Mode panel: thinking / reasoning / verify → writes to config.yaml
 - File upload to ~/.hermes/uploads/
+- Auto-installs missing deps on startup (yaml, openai, etc.)
+- Graceful fallback if any unified module fails to import
 
 Usage:
     python -m agent.unified.dashboard_server --port 8788
@@ -24,12 +26,119 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+# ─── Auto-install missing deps ──────────────────────────────────────────────
+
+def _ensure_dep(import_name: str, pip_name: str = None) -> bool:
+    """Try import; if fail, pip install. Returns True if available."""
+    try:
+        __import__(import_name)
+        return True
+    except ImportError:
+        pip_name = pip_name or import_name
+        print(f"[setup] installing {pip_name}...", flush=True)
+        import subprocess
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "--user", pip_name],
+                timeout=60, check=False,
+            )
+            __import__(import_name)
+            print(f"[setup] ✓ {pip_name} installed", flush=True)
+            return True
+        except Exception as e:
+            print(f"[setup] ✗ {pip_name} failed: {e}", flush=True)
+            return False
+
+# Critical deps for dashboard
+_ensure_dep("yaml", "pyyaml")
+_ensure_dep("openai")
+_ensure_dep("httpx")
+
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 UPLOAD_DIR = HERMES_HOME / "uploads"
 UNIFIED_DIR = HERMES_HOME / "unified"
+
+# Auto-create HERMES_HOME structure
+for _d in [HERMES_HOME, UPLOAD_DIR, UNIFIED_DIR, HERMES_HOME / "logs", HERMES_HOME / "memories"]:
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ─── Bootstrap default config if missing ────────────────────────────────────
+
+def _bootstrap_config():
+    """Create default config.yaml + .env if they don't exist, so dashboard
+    works on a fresh install without `hermes setup`."""
+    cfg_path = HERMES_HOME / "config.yaml"
+    if not cfg_path.exists():
+        default_cfg = {
+            "model": {
+                "provider": "xiaomi",
+                "default": "mimo-v2.5",
+                "base_url": "https://api.xiaomimimo.com/v1",
+            },
+            "unified": {
+                "reasoning": {"enabled": True},
+                "reflexion": {"enabled": True},
+                "smart_guardian": {"enabled": True},
+                "verifier": {"enabled": True},
+                "constitution": {"enabled": True},
+                "slow_thinking": {"enabled": True, "default_level": "balanced"},
+                "ensemble": {"enabled": False},
+                "embedding": {"enabled": False},
+                "user_model": {"enabled": True},
+                "clarifier": {"enabled": True},
+                "longrun": {"enabled": False},
+                "tool_router": {"enabled": True},
+                "cost_tracker": {"enabled": True},
+                "response_cache": {"enabled": True},
+                "output_formatter": {"enabled": True},
+                "skill_registry": {"enabled": True},
+                "api_registry": {"enabled": True},
+                "multi_provider": {"enabled": False},
+                "learning": {"enabled": True},
+                "skill_synthesis": {"enabled": True},
+                "task_planner": {"enabled": True},
+            },
+        }
+        try:
+            import yaml
+            cfg_path.write_text(
+                yaml.dump(default_cfg, default_flow_style=False, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+            print(f"[setup] ✓ created default {cfg_path}", flush=True)
+        except Exception as e:
+            print(f"[setup] ✗ failed to write default config: {e}", flush=True)
+
+    env_path = HERMES_HOME / ".env"
+    if not env_path.exists():
+        default_env = """# Hermes-Omni environment
+# Set your API key here, e.g.:
+# XIAOMI_API_KEY=sk-...
+# ZAI_API_KEY=...
+HERMES_YOLO_MODE=1
+HERMES_ACCEPT_HOOKS=1
+"""
+        try:
+            env_path.write_text(default_env, encoding="utf-8")
+            print(f"[setup] ✓ created default {env_path}", flush=True)
+        except Exception:
+            pass
+
+    mp_path = HERMES_HOME / "multi_provider.yaml"
+    if not mp_path.exists():
+        try:
+            import yaml
+            mp_path.write_text(
+                yaml.dump({"providers": {}, "strategy": "round-robin"}, default_flow_style=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+_bootstrap_config()
 
 # ─── Small helpers ───────────────────────────────────────────────────────────
 
@@ -1510,6 +1619,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(_get_logs())
             elif path == "/api/current-config":
                 self._send_json(_get_current_config())
+            elif path == "/api/health":
+                self._send_json(_health_check())
             elif path.startswith("/api/download/"):
                 self._serve_file(path[len("/api/download/"):])
             else:
@@ -1655,22 +1766,112 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _health_check() -> dict:
+    """Return system health info for /api/health endpoint."""
+    health = {
+        "ok": True,
+        "python": sys.version.split()[0],
+        "hermes_home": str(HERMES_HOME),
+        "repo_root": str(REPO_ROOT),
+        "deps": {},
+        "modules": {},
+        "config": {},
+        "warnings": [],
+    }
+
+    # Check deps
+    for dep, pip in [("yaml", "pyyaml"), ("openai", "openai"), ("httpx", "httpx"), ("requests", "requests")]:
+        try:
+            m = __import__(dep)
+            ver = getattr(m, "__version__", "?")
+            health["deps"][dep] = f"✓ {ver}"
+        except Exception as e:
+            health["deps"][dep] = f"✗ {e}"
+            health["ok"] = False
+            health["warnings"].append(f"Missing dep: {pip}")
+
+    # Check critical modules
+    for mod in ["hermes_cli.main", "hermes_cli.oneshot", "run_agent", "agent.conversation_loop"]:
+        try:
+            __import__(mod)
+            health["modules"][mod] = "✓"
+        except Exception as e:
+            health["modules"][mod] = f"✗ {type(e).__name__}: {e}"
+            health["warnings"].append(f"Module import fail: {mod}")
+
+    # Check config
+    cfg = _get_current_config()
+    health["config"] = cfg
+    if not cfg["has_key"]:
+        health["warnings"].append("No API key set. Visit Providers tab to set one.")
+    if not cfg["provider"]:
+        health["warnings"].append("No provider set.")
+
+    # Check files exist
+    health["files"] = {
+        "config.yaml": (HERMES_HOME / "config.yaml").exists(),
+        ".env": (HERMES_HOME / ".env").exists(),
+        "multi_provider.yaml": (HERMES_HOME / "multi_provider.yaml").exists(),
+    }
+
+    return health
+
+
 def run_server(port: int = 8788) -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     UNIFIED_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
-    print(f"═══ Hermes-Omni Dashboard v5 ═══")
-    print(f"  URL:      http://localhost:{port}")
-    print(f"  Hermes:   {HERMES_HOME}")
-    print(f"  Repo:     {REPO_ROOT}")
-    print(f"  Uploads:  {UPLOAD_DIR}")
-    cur = _get_current_config()
-    print(f"  Provider: {cur['provider'] or '(none)'} | Model: {cur['model'] or '(none)'} | Key: {'✓' if cur['has_key'] else '✗'}")
-    print()
+
+    print(f"═══ Hermes-Omni Dashboard v5 ═══", flush=True)
+    print(f"  URL:      http://localhost:{port}", flush=True)
+    print(f"  Hermes:   {HERMES_HOME}", flush=True)
+    print(f"  Repo:     {REPO_ROOT}", flush=True)
+    print(f"  Uploads:  {UPLOAD_DIR}", flush=True)
+
+    # Pre-flight check
+    print(f"\n  Pre-flight check:", flush=True)
+    health = _health_check()
+    for dep, status in health["deps"].items():
+        print(f"    dep {dep}: {status}", flush=True)
+    for mod, status in health["modules"].items():
+        print(f"    mod {mod}: {status}", flush=True)
+    cur = health["config"]
+    print(f"    provider: {cur.get('provider') or '(none)'}", flush=True)
+    print(f"    model:    {cur.get('model') or '(none)'}", flush=True)
+    print(f"    key:      {'✓' if cur.get('has_key') else '✗ (chưa có — vào tab Provider)'}", flush=True)
+    if health["warnings"]:
+        print(f"\n  ⚠ Cảnh báo:", flush=True)
+        for w in health["warnings"]:
+            print(f"    - {w}", flush=True)
+    print(flush=True)
+
+    # Try common ports if 8788 is busy
+    ports_to_try = [port]
+    if port == 8788:
+        ports_to_try += [8789, 8790, 8899, 9000]
+    server = None
+    actual_port = None
+    for p in ports_to_try:
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", p), DashboardHandler)
+            actual_port = p
+            break
+        except OSError as e:
+            print(f"  Port {p} busy: {e}", flush=True)
+            continue
+    if server is None:
+        print(f"❌ Không mở được server trên ports {ports_to_try}", flush=True)
+        sys.exit(1)
+    if actual_port != port:
+        print(f"  → Đổi sang port {actual_port}", flush=True)
+
+    print(f"  ▶ Server chạy tại: http://localhost:{actual_port}", flush=True)
+    print(f"  ▶ Health: http://localhost:{actual_port}/api/health", flush=True)
+    print(f"  Ctrl+C để dừng\n", flush=True)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\nShutting down...", flush=True)
         server.shutdown()
 
 
