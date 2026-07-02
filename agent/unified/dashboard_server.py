@@ -464,17 +464,97 @@ def _get_logs() -> list:
 _chat_lock = threading.Lock()
 
 
-def _send_to_agent(message: str, timeout: int = 90) -> dict:
-    """Run one-shot through the real Hermes agent via subprocess.
-
-    Using subprocess (not in-process) so:
-    - Each chat is isolated — a hang/crash doesn't take down the server
-    - We can enforce a hard timeout
-    - No global state leakage between chats
+def _send_to_agent_fast(message: str, timeout: int = 45) -> dict:
+    """FAST MODE: Call LLM API directly (no hermes subprocess, no tools).
+    
+    Much faster + more reliable on UserLAnd/ARM64 where hermes subprocess
+    can hang due to tool calling loop.
+    
+    Returns plain text response from the model.
     """
     if not message or not message.strip():
         return {"success": False, "error": "Tin nhắn trống"}
+    
+    with _chat_lock:
+        start = time.time()
+        print(f"[chat-fast] start: {message[:80]!r}", flush=True)
+        
+        # Read config
+        config = _read_yaml(HERMES_HOME / "config.yaml")
+        model_cfg = config.get("model", {}) if config else {}
+        provider = model_cfg.get("provider", "")
+        model = model_cfg.get("default", "")
+        base_url = model_cfg.get("base_url", "")
+        
+        # Read API key from .env
+        env_path = HERMES_HOME / ".env"
+        api_key = ""
+        key_var = PROVIDER_ENV_KEYS.get(provider, f"{provider.upper()}_API_KEY")
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{key_var}="):
+                    api_key = line.split("=", 1)[1].strip()
+                    break
+                if "_API_KEY=" in line and not line.startswith("#"):
+                    v = line.split("=", 1)[1].strip()
+                    if v and not v.startswith("your-"):
+                        api_key = v
+        
+        if not api_key:
+            return {"success": False, "error": "Chưa có API key. Vào tab Provider để setup."}
+        if not base_url:
+            return {"success": False, "error": "Chưa có base_url."}
+        if not model:
+            return {"success": False, "error": "Chưa có model."}
+        
+        # Call API directly using urllib (no external deps)
+        try:
+            from urllib.request import Request, urlopen
+            url = f"{base_url.rstrip('/')}/chat/completions"
+            body = json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Bạn là Hermes-Omni, trợ lý AI tiếng Việt thân thiện. Trả lời ngắn gọn, rõ ràng."},
+                    {"role": "user", "content": message},
+                ],
+                "max_tokens": 1000,
+                "temperature": 0.7,
+            }).encode("utf-8")
+            req = Request(url, data=body, headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }, method="POST")
+            with urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            elapsed = time.time() - start
+            usage = result.get("usage", {})
+            print(f"[chat-fast] done in {elapsed:.1f}s, tokens={usage.get('total_tokens', '?')}", flush=True)
+            if content:
+                return {
+                    "success": True,
+                    "response": content.strip(),
+                    "elapsed": round(elapsed, 1),
+                    "tokens": usage.get("total_tokens", 0),
+                    "mode": "fast",
+                }
+            return {"success": False, "error": "API trả response rỗng"}
+        except Exception as exc:
+            elapsed = time.time() - start
+            print(f"[chat-fast] ERROR after {elapsed:.1f}s: {type(exc).__name__}: {exc}", flush=True)
+            return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
 
+
+def _send_to_agent(message: str, timeout: int = 90) -> dict:
+    """Run one-shot through the real Hermes agent via subprocess.
+    
+    Uses FAST MODE by default (direct API call) for reliability.
+    Falls back to hermes subprocess if fast=0 in request.
+    """
+    if not message or not message.strip():
+        return {"success": False, "error": "Tin nhắn trống"}
+    
     with _chat_lock:
         import subprocess
 
@@ -504,22 +584,21 @@ def _send_to_agent(message: str, timeout: int = 90) -> dict:
                 timeout=timeout,
                 cwd=str(REPO_ROOT),
                 env=env,
-                start_new_session=True,  # new process group → kill cleanup works
+                start_new_session=True,
             )
             elapsed = time.time() - start
             response = (proc.stdout or "").strip()
             err_text = (proc.stderr or "").strip()
             print(f"[chat] done in {elapsed:.1f}s, rc={proc.returncode}, out={len(response)}B, err={len(err_text)}B", flush=True)
             if proc.returncode == 0 and response:
-                # Filter out known non-response lines
                 lines = [l for l in response.splitlines() if l.strip()
                          and not l.startswith("[Note:")
                          and not l.startswith("Calling tool")
                          and not l.startswith("Tool output")]
                 cleaned = "\n".join(lines).strip() if lines else response
-                return {"success": True, "response": cleaned, "elapsed": round(elapsed, 1)}
+                return {"success": True, "response": cleaned, "elapsed": round(elapsed, 1), "mode": "hermes"}
             if response:
-                return {"success": True, "response": response, "warning": err_text[:200] if err_text else None, "elapsed": round(elapsed, 1)}
+                return {"success": True, "response": response, "warning": err_text[:200] if err_text else None, "elapsed": round(elapsed, 1), "mode": "hermes"}
             return {
                 "success": False,
                 "error": (err_text[:300] if err_text else f"Agent exit code {proc.returncode}"),
@@ -527,7 +606,6 @@ def _send_to_agent(message: str, timeout: int = 90) -> dict:
         except subprocess.TimeoutExpired:
             elapsed = time.time() - start
             print(f"[chat] TIMEOUT after {elapsed:.1f}s", flush=True)
-            # Kill entire process group to avoid zombie subprocesses
             try:
                 import signal as _sig
                 os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)  # type: ignore
@@ -1125,6 +1203,11 @@ select.search option{background:var(--card);color:var(--text)}
     <div class="file-list" id="fl"></div>
     <div class="mode-panel" id="modePanel">
       <div class="mode-bar">
+        <div class="mode-group"><span class="mode-label">🚀 Engine</span>
+          <button class="mode-btn active" data-mt="engine" data-mv="fast" title="Gọi API trực tiếp — nhanh, không hang">Fast</button>
+          <button class="mode-btn" data-mt="engine" data-mv="full" title="Hermes subprocess + tools + reasoning">Full</button>
+        </div>
+        <div class="mode-divider"></div>
         <div class="mode-group"><span class="mode-label">🧠 Thinking</span>
           <button class="mode-btn" data-mt="thinking" data-mv="fast">Fast</button>
           <button class="mode-btn active" data-mt="thinking" data-mv="balanced">Balanced</button>
@@ -1205,7 +1288,7 @@ const T = {
 };
 let msgs = [];
 let visCount = 25;
-let curMode = {thinking:'balanced', reasoning:'standard', verify:'on'};
+let curMode = {engine:'fast', thinking:'balanced', reasoning:'standard', verify:'on'};
 let sending = false;
 
 // ─── Navigation ───
@@ -1356,9 +1439,10 @@ async function send(){
   sendBtn.disabled = true;
   sendBtn.textContent = '⏳...';
   addM('user', m);
-  addM('sys', '⏳ Đang suy nghĩ...');
+  const engineLabel = curMode.engine === 'fast' ? '🚀 Fast' : '🧠 Full';
+  addM('sys', '⏳ ' + engineLabel + ' đang suy nghĩ...');
   try {
-    const r = await post('chat', {message:m});
+    const r = await post('chat', {message:m, fast: curMode.engine === 'fast' ? '1' : '0'});
     // remove the "thinking..." message
     const last = msgs[msgs.length-1];
     if (last && last.t === 'sys' && last.c.startsWith('⏳')) msgs.pop();
@@ -1999,7 +2083,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = {}
 
         routes = {
-            "/api/action/chat": lambda: _send_to_agent(data.get("message", "")),
+            "/api/action/chat": lambda: (
+                _send_to_agent_fast(data.get("message", ""))
+                if str(data.get("fast", "1")) != "0"
+                else _send_to_agent(data.get("message", ""))
+            ),
             "/api/action/setup-provider": lambda: _action_setup_provider(data),
             "/api/action/test-key": lambda: _action_test_key(data),
             "/api/action/toggle-config": lambda: _action_toggle_config(data),
