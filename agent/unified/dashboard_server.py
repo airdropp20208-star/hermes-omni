@@ -1565,26 +1565,56 @@ async function loadLogs(){
 
 // ─── Init ───
 loadOverview();
-setInterval(loadOverview, 10000);
-setInterval(loadLogs, 5000);
+// Auto-refresh only when NOT on chat tab (chat can take 30-60s, don't interrupt)
+setInterval(() => {
+  const chatView = document.getElementById('chat');
+  if (!chatView || !chatView.classList.contains('active')) {
+    loadOverview();
+  }
+}, 15000);
+setInterval(() => {
+  const logsView = document.getElementById('logs');
+  if (logsView && logsView.classList.contains('active')) {
+    loadLogs();
+  }
+}, 8000);
 </script>
 </body></html>"""
 
 
 # ─── HTTP handler ───────────────────────────────────────────────────────────
 
+class _StableHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with daemon threads + shorter timeouts so
+    abandoned connections don't pile up and crash the server."""
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 8  # reject if too many queued
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
+    # Use HTTP/1.0 to avoid keep-alive connection management issues
+    # (browser holding connections open while server busy = problems)
     protocol_version = "HTTP/1.1"
-    timeout = 300  # 5 min for long chat requests
+    timeout = 30  # shorter timeout per connection
+
+    def handle_one_request(self):
+        """Override to swallow ALL errors so server never crashes from a single request."""
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:
+            try:
+                print(f"[http] error: {type(e).__name__}: {e}", flush=True)
+            except Exception:
+                pass
 
     def _safe_write(self, data: bytes) -> bool:
-        """Write to wfile, swallowing BrokenPipeError / ConnectionResetError
-        when the client closes early."""
+        """Write to wfile, swallowing any error when the client closes early."""
         try:
             self.wfile.write(data)
             return True
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            return False
         except Exception:
             return False
 
@@ -1736,7 +1766,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self._safe_write(data)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        except Exception:
             pass
 
     def _send_html(self, html: str):
@@ -1745,9 +1775,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self._safe_write(body)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        except Exception:
             pass
 
     def _send_json(self, data, code: int = 200):
@@ -1757,9 +1788,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "close")
             self.end_headers()
             self._safe_write(body)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        except Exception:
             pass
 
     def log_message(self, *args):
@@ -1852,7 +1884,7 @@ def run_server(port: int = 8788) -> None:
     actual_port = None
     for p in ports_to_try:
         try:
-            server = ThreadingHTTPServer(("0.0.0.0", p), DashboardHandler)
+            server = _StableHTTPServer(("0.0.0.0", p), DashboardHandler)
             actual_port = p
             break
         except OSError as e:
