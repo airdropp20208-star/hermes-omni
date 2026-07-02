@@ -896,6 +896,177 @@ def _prewarm_agents():
     threading.Thread(target=warm, daemon=True).start()
 
 
+# ─── Multi-step task execution (crazy agent mode) ───────────────────────────
+
+_tasks: dict = {}  # task_id → {id, status, prompt, mode, steps, current, result, error, started, updated}
+_task_lock = threading.Lock()
+
+
+def _create_task(prompt: str, mode: str = "thinking") -> dict:
+    """Create a multi-step background task.
+    
+    Task lifecycle:
+    1. CREATE: parse prompt into subtasks via TaskPlanner
+    2. RUN: execute each subtask via agent (with history between steps)
+    3. VERIFY: check result, replan if needed
+    4. COMPLETE: return final result
+    
+    User can watch progress via /api/task/<id> or Tasks tab.
+    """
+    import uuid
+    task_id = str(uuid.uuid4())[:8]
+    task = {
+        "id": task_id,
+        "prompt": prompt,
+        "mode": mode,
+        "status": "planning",  # planning → running → verifying → done | error
+        "steps": [],
+        "current_step": 0,
+        "result": "",
+        "error": "",
+        "started": time.time(),
+        "updated": time.time(),
+        "log": [],
+    }
+    with _task_lock:
+        _tasks[task_id] = task
+    # Start background thread
+    threading.Thread(target=_run_task, args=(task_id,), daemon=True).start()
+    return task
+
+
+def _log_task(task_id: str, msg: str):
+    with _task_lock:
+        t = _tasks.get(task_id)
+        if t:
+            t["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            t["updated"] = time.time()
+            if len(t["log"]) > 100:
+                t["log"] = t["log"][-100:]
+
+
+def _run_task(task_id: str):
+    """Background task executor — multi-step with planning + verification."""
+    try:
+        with _task_lock:
+            task = _tasks.get(task_id)
+        if not task:
+            return
+
+        prompt = task["prompt"]
+        mode = task["mode"]
+        _log_task(task_id, f"Task started: {prompt[:80]}")
+
+        # Step 1: Plan — decompose into subtasks
+        with _task_lock:
+            _tasks[task_id]["status"] = "planning"
+
+        # Use agent to plan
+        plan_prompt = f"""Bạn là task planner. Phân tích request và chia thành 2-5 bước rõ ràng.
+
+Request: {prompt}
+
+Trả về JSON format:
+{{"steps": ["bước 1", "bước 2", ...]}}
+
+Chỉ trả JSON, không thêm gì."""
+
+        _log_task(task_id, "Planning: decomposing into subtasks...")
+        plan_result = _send_to_agent(plan_prompt, mode=mode)
+        if not plan_result.get("success"):
+            raise Exception(f"Planning failed: {plan_result.get('error')}")
+
+        # Parse steps
+        import json as _json
+        plan_text = plan_result.get("response", "")
+        try:
+            # Extract JSON from response
+            import re
+            json_match = re.search(r'\{[^}]+\}', plan_text, re.DOTALL)
+            if json_match:
+                plan_data = _json.loads(json_match.group())
+                steps = plan_data.get("steps", [])
+            else:
+                steps = [prompt]  # fallback: 1 step
+        except Exception:
+            steps = [prompt]  # fallback
+
+        if not steps:
+            steps = [prompt]
+
+        with _task_lock:
+            _tasks[task_id]["steps"] = steps
+            _tasks[task_id]["status"] = "running"
+            _tasks[task_id]["current_step"] = 0
+
+        _log_task(task_id, f"Planned {len(steps)} steps: {steps}")
+
+        # Step 2: Execute each subtask
+        context = f"Task gốc: {prompt}\n"
+        for i, step in enumerate(steps):
+            with _task_lock:
+                _tasks[task_id]["current_step"] = i
+
+            _log_task(task_id, f"Step {i+1}/{len(steps)}: {step}")
+
+            step_prompt = f"""{context}
+
+Bước {i+1}/{len(steps)}: {step}
+
+Thực hiện bước này. Trả lời ngắn gọn, tập trung vào bước này."""
+
+            result = _send_to_agent(step_prompt, mode=mode)
+            if not result.get("success"):
+                _log_task(task_id, f"Step {i+1} FAILED: {result.get('error')}")
+                with _task_lock:
+                    _tasks[task_id]["status"] = "error"
+                    _tasks[task_id]["error"] = f"Step {i+1} failed: {result.get('error')}"
+                return
+
+            step_result = result.get("response", "")
+            context += f"\nBước {i+1} done: {step_result[:200]}\n"
+            _log_task(task_id, f"Step {i+1} done: {step_result[:100]}...")
+
+        # Step 3: Verify + summarize
+        with _task_lock:
+            _tasks[task_id]["status"] = "verifying"
+
+        _log_task(task_id, "Verifying + summarizing...")
+        verify_prompt = f"""{context}
+
+Task hoàn thành. Tóm tắt kết quả cuối cùng cho user.
+Task gốc: {prompt}
+
+Trả lời tự nhiên, ngắn gọn."""
+
+        final = _send_to_agent(verify_prompt, mode=mode)
+        final_response = final.get("response", "") if final.get("success") else "Task hoàn thành nhưng không tóm tắt được."
+
+        with _task_lock:
+            _tasks[task_id]["status"] = "done"
+            _tasks[task_id]["result"] = final_response
+            _tasks[task_id]["current_step"] = len(steps)
+
+        _log_task(task_id, f"Task DONE: {final_response[:100]}...")
+
+    except Exception as e:
+        _log_task(task_id, f"Task ERROR: {e}")
+        with _task_lock:
+            if task_id in _tasks:
+                _tasks[task_id]["status"] = "error"
+                _tasks[task_id]["error"] = str(e)
+
+
+def _get_task(task_id: str) -> dict:
+    with _task_lock:
+        return _tasks.get(task_id, {})
+
+
+def _list_tasks() -> list:
+    with _task_lock:
+        return list(_tasks.values())
+
+
 # ─── Actions ────────────────────────────────────────────────────────────────
 
 def _action_setup_provider(data: dict) -> dict:
@@ -1476,6 +1647,7 @@ select.search option{background:var(--card);color:var(--text)}
   <button class="nav-btn" data-view="skills" title="Kỹ năng">📚</button>
   <button class="nav-btn" data-view="costs" title="Chi phí">💰</button>
   <button class="nav-btn" data-view="logs" title="Nhật ký">📋</button>
+  <button class="nav-btn" data-view="tasks" title="Tác vụ dài hạn">🎯</button>
   <div class="nav-spacer"></div>
   <button class="nav-btn" onclick="logout()" title="Đăng xuất">🔒</button>
 </nav>
@@ -1574,6 +1746,26 @@ select.search option{background:var(--card);color:var(--text)}
   <div class="card" style="padding:8px;max-height:560px;overflow:auto" id="lf"></div>
 </div>
 
+<div id="tasks" class="view">
+  <div class="card">
+    <div class="section-title">🎯 Tác vụ dài hạn (multi-step)</div>
+    <div class="section-sub">Agent tự chia task thành subtasks, chạy nền, báo tiến độ</div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <textarea id="taskPrompt" class="search" style="margin:0;min-height:60px;resize:vertical" placeholder="Mô tả task phức tạp... vd: Viết report về Python, test code, deploy"></textarea>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+      <span style="font-size:.7rem;color:var(--dim)">Mode:</span>
+      <select id="taskMode" class="search" style="margin:0;width:auto">
+        <option value="fast">⚡ Fast</option>
+        <option value="thinking" selected>🧠 Thinking</option>
+        <option value="max">🚀 Max</option>
+      </select>
+      <button class="btn btn-p" onclick="createTask()">🚀 Tạo task</button>
+    </div>
+  </div>
+  <div id="taskList"></div>
+</div>
+
 </div>
 
 <script>
@@ -1601,6 +1793,7 @@ document.querySelectorAll('.nav-btn[data-view]').forEach(btn => {
     if (v === 'skills') loadSkills();
     if (v === 'costs') loadCosts();
     if (v === 'logs') loadLogs();
+    if (v === 'tasks') loadTasks();
   });
 });
 
@@ -2196,6 +2389,91 @@ async function loadLogs(){
   ).join('');
 }
 
+// ─── Tasks (multi-step background) ───
+async function createTask(){
+  const p = document.getElementById('taskPrompt').value.trim();
+  if (!p) return;
+  const mode = document.getElementById('taskMode').value;
+  document.getElementById('taskPrompt').value = '';
+  const r = await post('create-task', {message:p, engine:mode});
+  if (r && r.id) {
+    addM('sys', '🎯 Task '+r.id+' đã tạo: '+esc(p.substring(0,60)));
+    loadTasks();
+    // Auto-switch to tasks tab
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('tasks').classList.add('active');
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector('[data-view="tasks"]').classList.add('active');
+    document.getElementById('vt').textContent = 'Tác vụ dài hạn';
+  } else {
+    alert(r ? r.error : 'Lỗi tạo task');
+  }
+}
+
+let _taskPollTimer = null;
+async function loadTasks(){
+  const tasks = await api('tasks');
+  if (!tasks || !tasks.length) {
+    document.getElementById('taskList').innerHTML = '<div class="empty"><div class="empty-icon">🎯</div>Chưa có task nào.<br>Tạo task phức tạp ở form trên.</div>';
+    return;
+  }
+  let html = '';
+  for (const t of tasks) {
+    const statusColor = t.status==='done'?'var(--green)':t.status==='error'?'var(--red)':t.status==='running'?'var(--accent)':'var(--muted)';
+    const statusIcon = t.status==='done'?'✓':t.status==='error'?'✗':t.status==='running'?'▶':t.status==='planning'?'🧠':t.status==='verifying'?'🔍':'⏳';
+    const pct = t.steps.length > 0 ? Math.round((t.current_step / t.steps.length) * 100) : 0;
+    const elapsed = Math.round(t.updated - t.started);
+    html += '<div class="card" style="border-left:3px solid '+statusColor+'">'+
+      '<div style="display:flex;justify-content:space-between;align-items:start">'+
+        '<div style="flex:1">'+
+          '<div style="font-weight:700;font-size:.85rem">'+statusIcon+' Task #'+esc(t.id)+' · '+esc(t.status)+'</div>'+
+          '<div style="font-size:.78rem;color:var(--dim);margin:4px 0">'+esc(t.prompt.substring(0,100))+'</div>'+
+        '</div>'+
+        '<div style="font-size:.66rem;color:var(--muted);font-family:var(--mono)">'+elapsed+'s</div>'+
+      '</div>';
+    // Progress bar
+    if (t.steps.length > 0) {
+      html += '<div style="background:var(--border);height:6px;border-radius:3px;margin:8px 0;overflow:hidden">'+
+        '<div style="background:'+statusColor+';height:100%;width:'+pct+'%;transition:width .3s"></div></div>';
+      html += '<div style="font-size:.66rem;color:var(--muted);margin-bottom:6px">Step '+(t.current_step+1)+'/'+t.steps.length+' ('+pct+'%)</div>';
+      // Steps list
+      html += '<div style="font-size:.7rem">';
+      t.steps.forEach((s, i) => {
+        const done = i < t.current_step;
+        const current = i === t.current_step && t.status === 'running';
+        const icon = done ? '✓' : current ? '▶' : '○';
+        const color = done ? 'var(--green)' : current ? 'var(--accent)' : 'var(--muted)';
+        html += '<div style="color:'+color+';padding:2px 0">'+icon+' '+esc(s.substring(0,80))+'</div>';
+      });
+      html += '</div>';
+    }
+    // Result
+    if (t.result) {
+      html += '<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px;font-size:.76rem"><b>Kết quả:</b><br>'+esc(t.result.substring(0,300))+'</div>';
+    }
+    // Error
+    if (t.error) {
+      html += '<div style="margin-top:8px;padding:8px;background:var(--red-soft);border-radius:6px;font-size:.76rem;color:var(--red)"><b>Lỗi:</b> '+esc(t.error)+'</div>';
+    }
+    // Log (last 5)
+    if (t.log && t.log.length > 0) {
+      html += '<details style="margin-top:8px"><summary style="font-size:.66rem;color:var(--muted);cursor:pointer">Log ('+t.log.length+' entries)</summary>'+
+        '<div style="font-size:.62rem;font-family:var(--mono);color:var(--dim);margin-top:4px;max-height:120px;overflow:auto">'+
+        t.log.slice(-10).map(l => esc(l)).join('<br>')+'</div></details>';
+    }
+    html += '</div>';
+  }
+  document.getElementById('taskList').innerHTML = html;
+  // Auto-refresh if any task is running
+  const hasRunning = tasks.some(t => ['planning','running','verifying'].includes(t.status));
+  if (hasRunning && !_taskPollTimer) {
+    _taskPollTimer = setInterval(loadTasks, 3000);
+  } else if (!hasRunning && _taskPollTimer) {
+    clearInterval(_taskPollTimer);
+    _taskPollTimer = null;
+  }
+}
+
 // ─── Init: check auth first ───
 async function init() {
   const token = localStorage.getItem('hermes_token');
@@ -2461,6 +2739,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(_get_current_config())
             elif path == "/api/health":
                 self._send_json(_health_check())
+            elif path == "/api/tasks":
+                self._send_json(_list_tasks())
+            elif path.startswith("/api/task/"):
+                task_id = path[len("/api/task/"):]
+                self._send_json(_get_task(task_id))
             elif path == "/api/chat/stream":
                 self._handle_sse_chat()
             elif path.startswith("/api/download/"):
@@ -2503,6 +2786,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         routes = {
             "/api/action/chat": lambda: _send_to_agent(data.get("message", ""), mode=data.get("engine", "fast")),
+            "/api/action/create-task": lambda: _create_task(data.get("message", ""), mode=data.get("engine", "thinking")),
             "/api/action/setup-provider": lambda: _action_setup_provider(data),
             "/api/action/test-key": lambda: _action_test_key(data),
             "/api/action/toggle-config": lambda: _action_toggle_config(data),
