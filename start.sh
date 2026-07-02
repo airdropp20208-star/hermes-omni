@@ -56,11 +56,14 @@ sleep 1
 
 # ─── Launch ────────────────────────────────────────────────────────────
 echo ""
-echo "🚀 Khởi động Hermes-Omni Dashboard..."
+echo "🚀 Khởi động Hermes-Omni Dashboard v6..."
 echo "   Port:         $PORT"
+echo "   Bind:         127.0.0.1 (chỉ localhost — an toàn)"
 echo "   Hermes home:  $HERMES_HOME"
 echo "   URL:          http://localhost:$PORT"
+echo "   Token file:   $HERMES_HOME/.dashboard_token"
+echo "   ⚠ Truy cập ngoài localhost: dùng SSH tunnel"
 echo ""
 
 export HERMES_HOME
-exec "$PYTHON" -m agent.unified.dashboard_server --port "$PORT"
+exec "$PYTHON" -m agent.unified.dashboard_server --port "$PORT" --host 127.0.0.1

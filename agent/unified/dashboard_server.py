@@ -26,33 +26,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-# ─── Auto-install missing deps ──────────────────────────────────────────────
+# ─── Dep check (NO auto-install — too risky on UserLAnd/Termux) ────────────
 
-def _ensure_dep(import_name: str, pip_name: str = None) -> bool:
-    """Try import; if fail, pip install. Returns True if available."""
+def _check_dep(import_name: str, pip_name: str = None) -> bool:
+    """Check if dep is importable. Print install hint if not. NO auto-install."""
     try:
         __import__(import_name)
         return True
     except ImportError:
         pip_name = pip_name or import_name
-        print(f"[setup] installing {pip_name}...", flush=True)
-        import subprocess
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", "--user", pip_name],
-                timeout=60, check=False,
-            )
-            __import__(import_name)
-            print(f"[setup] ✓ {pip_name} installed", flush=True)
-            return True
-        except Exception as e:
-            print(f"[setup] ✗ {pip_name} failed: {e}", flush=True)
-            return False
+        print(f"[setup] ✗ MISSING dep: {pip_name}", flush=True)
+        print(f"        Cài: pip install --user {pip_name}", flush=True)
+        return False
 
-# Critical deps for dashboard
-_ensure_dep("yaml", "pyyaml")
-_ensure_dep("openai")
-_ensure_dep("httpx")
+# Check critical deps at import time (no side effects)
+_DEPS_OK = {
+    "yaml": _check_dep("yaml", "pyyaml"),
+    "openai": _check_dep("openai"),
+    "httpx": _check_dep("httpx"),
+}
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
@@ -1036,8 +1028,50 @@ select.search option{background:var(--card);color:var(--text)}
   .mode-divider{display:none}
   .view{padding:14px}
 }
+
+/* ─── Login overlay ─── */
+.login-overlay{
+  display:none;position:fixed;inset:0;background:rgba(61,53,40,.6);
+  backdrop-filter:blur(6px);z-index:9999;align-items:center;justify-content:center;
+}
+.login-box{
+  background:var(--card);border:1px solid var(--border-2);border-radius:var(--r-lg);
+  padding:28px 32px;max-width:380px;width:90%;box-shadow:var(--shadow-lg);
+}
+.login-title{font-size:1.1rem;font-weight:700;margin-bottom:6px;color:var(--accent-2)}
+.login-sub{font-size:.78rem;color:var(--dim);margin-bottom:18px}
+.login-input{
+  width:100%;padding:11px 14px;border:1px solid var(--border);border-radius:var(--r);
+  font-size:.85rem;background:var(--bg);color:var(--text);font-family:var(--mono);
+  margin-bottom:10px;
+}
+.login-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.login-btn{
+  width:100%;padding:11px;border-radius:var(--r);background:var(--accent);color:#fff;
+  border:none;font-weight:700;font-size:.85rem;cursor:pointer;font-family:inherit;
+}
+.login-btn:hover{background:var(--accent-2)}
+.login-error{color:var(--red);font-size:.72rem;margin-top:8px;display:none}
+.login-hint{font-size:.66rem;color:var(--muted);margin-top:14px;line-height:1.5}
+.login-hint code{background:rgba(61,53,40,.08);padding:1px 5px;border-radius:3px;font-family:var(--mono)}
 </style></head>
 <body>
+
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <div class="login-title">🔐 Đăng nhập Dashboard</div>
+    <div class="login-sub">Nhập token hiển thị trong terminal khi khởi động server</div>
+    <input type="password" class="login-input" id="loginToken" placeholder="Token..." onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="login-btn" onclick="doLogin()">Đăng nhập</button>
+    <div class="login-error" id="loginError"></div>
+    <div class="login-hint">
+      Token được in trong terminal khi chạy:<br>
+      <code>python -m agent.unified.dashboard_server</code><br><br>
+      Hoặc xem file: <code>~/.hermes/.dashboard_token</code>
+    </div>
+  </div>
+</div>
+
 <nav class="sidebar">
   <div class="logo">⚡</div>
   <button class="nav-btn active" data-view="chat" title="Trò chuyện">💬</button>
@@ -1048,6 +1082,7 @@ select.search option{background:var(--card);color:var(--text)}
   <button class="nav-btn" data-view="costs" title="Chi phí">💰</button>
   <button class="nav-btn" data-view="logs" title="Nhật ký">📋</button>
   <div class="nav-spacer"></div>
+  <button class="nav-btn" onclick="logout()" title="Đăng xuất">🔒</button>
 </nav>
 <div class="main">
 <div class="topbar">
@@ -1190,19 +1225,56 @@ function fmtR(t){
 function fn(n){n=+n||0;return n>1e6?(n/1e6).toFixed(1)+'M':n>1e3?(n/1e3).toFixed(0)+'K':String(n)}
 
 async function api(p){
-  try { return await (await fetch('/api/'+p)).json(); }
-  catch(e){ return null; }
+  try {
+    const r = await fetch('/api/'+p, {headers: _authHeaders()});
+    if (r.status === 401) { showLogin(); return null; }
+    return await r.json();
+  } catch(e){ return null; }
 }
 async function post(a,d){
   try {
     const r = await fetch('/api/action/'+a, {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d||{})
+      method:'POST',
+      headers: Object.assign({'Content-Type':'application/json'}, _authHeaders()),
+      body: JSON.stringify(d||{})
     });
+    if (r.status === 401) { showLogin(); return {success:false, error:'Cần đăng nhập'}; }
     if (!r.ok) {
       try { return await r.json(); } catch(_) { return {success:false, error:'HTTP '+r.status}; }
     }
     return await r.json();
   } catch(e) { return {success:false, error:'Lỗi kết nối: '+e.message}; }
+}
+
+// ─── Auth ───
+function _authHeaders(){
+  const t = localStorage.getItem('hermes_token') || '';
+  return t ? {'Authorization': 'Bearer '+t} : {};
+}
+function showLogin(){
+  document.getElementById('loginOverlay').style.display = 'flex';
+}
+function hideLogin(){
+  document.getElementById('loginOverlay').style.display = 'none';
+}
+async function doLogin(){
+  const t = document.getElementById('loginToken').value.trim();
+  if (!t) return;
+  localStorage.setItem('hermes_token', t);
+  // Test token by calling /api/health
+  const r = await fetch('/api/health', {headers: _authHeaders()});
+  if (r.ok) {
+    hideLogin();
+    location.reload();
+  } else {
+    document.getElementById('loginError').textContent = '❌ Token không đúng';
+    document.getElementById('loginError').style.display = 'block';
+    localStorage.removeItem('hermes_token');
+  }
+}
+function logout(){
+  localStorage.removeItem('hermes_token');
+  showLogin();
 }
 
 // ─── Chat ───
@@ -1563,17 +1635,42 @@ async function loadLogs(){
   ).join('');
 }
 
-// ─── Init ───
-loadOverview();
+// ─── Init: check auth first ───
+async function init() {
+  const token = localStorage.getItem('hermes_token');
+  if (!token) {
+    showLogin();
+    return;
+  }
+  // Verify token
+  try {
+    const r = await fetch('/api/health', {headers: _authHeaders()});
+    if (r.status === 401) {
+      showLogin();
+      return;
+    }
+  } catch(e) {
+    // Server might be down — show login anyway
+    showLogin();
+    return;
+  }
+  // Token OK — load dashboard
+  loadOverview();
+}
+init();
 // Auto-refresh only when NOT on chat tab (chat can take 30-60s, don't interrupt)
 setInterval(() => {
   const chatView = document.getElementById('chat');
+  const overlay = document.getElementById('loginOverlay');
+  if (overlay && overlay.style.display === 'flex') return;
   if (!chatView || !chatView.classList.contains('active')) {
     loadOverview();
   }
 }, 15000);
 setInterval(() => {
   const logsView = document.getElementById('logs');
+  const overlay = document.getElementById('loginOverlay');
+  if (overlay && overlay.style.display === 'flex') return;
   if (logsView && logsView.classList.contains('active')) {
     loadLogs();
   }
@@ -1592,11 +1689,59 @@ class _StableHTTPServer(ThreadingHTTPServer):
     request_queue_size = 8  # reject if too many queued
 
 
+# ─── Security: auth token + rate limit + host guard ─────────────────────────
+
+import hmac
+import secrets
+
+_AUTH_TOKEN_FILE = HERMES_HOME / ".dashboard_token"
+_RATE_LIMIT_WINDOW = 60  # seconds
+_RATE_LIMIT_MAX = 120  # requests per window per IP
+_rate_log: dict = {}  # ip -> [timestamps]
+
+
+def _get_or_create_token() -> str:
+    """Get or create a random auth token. Token persists in ~/.hermes/.dashboard_token."""
+    if _AUTH_TOKEN_FILE.exists():
+        try:
+            t = _AUTH_TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if t and len(t) >= 16:
+                return t
+        except Exception:
+            pass
+    t = secrets.token_urlsafe(32)
+    try:
+        _AUTH_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _AUTH_TOKEN_FILE.write_text(t, encoding="utf-8")
+        _AUTH_TOKEN_FILE.chmod(0o600)  # only owner can read
+    except Exception as e:
+        print(f"[auth] ⚠ không ghi được token file: {e}", flush=True)
+    return t
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Simple in-memory rate limit. Returns True if OK, False if exceeded."""
+    now = time.time()
+    recent = [t for t in _rate_log.get(ip, []) if now - t < _RATE_LIMIT_WINDOW]
+    if len(recent) >= _RATE_LIMIT_MAX:
+        return False
+    recent.append(now)
+    _rate_log[ip] = recent
+    # GC old IPs occasionally
+    if len(_rate_log) > 1000:
+        for k in list(_rate_log.keys()):
+            _rate_log[k] = [t for t in _rate_log[k] if now - t < _RATE_LIMIT_WINDOW]
+            if not _rate_log[k]:
+                del _rate_log[k]
+    return True
+
+
+_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
-    # Use HTTP/1.0 to avoid keep-alive connection management issues
-    # (browser holding connections open while server busy = problems)
     protocol_version = "HTTP/1.1"
-    timeout = 30  # shorter timeout per connection
+    timeout = 30
 
     def handle_one_request(self):
         """Override to swallow ALL errors so server never crashes from a single request."""
@@ -1611,12 +1756,75 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 pass
 
     def _safe_write(self, data: bytes) -> bool:
-        """Write to wfile, swallowing any error when the client closes early."""
         try:
             self.wfile.write(data)
             return True
         except Exception:
             return False
+
+    def _client_ip(self) -> str:
+        try:
+            return self.client_address[0]
+        except Exception:
+            return "?"
+
+    def _check_security(self) -> bool:
+        """Returns True if request passes all security checks. Sends 403/429 if not."""
+        # 1. DNS-rebinding guard: only allow localhost host header
+        host = self.headers.get("Host", "").split(":")[0].lower()
+        if host and host not in _ALLOWED_HOSTS:
+            try:
+                self.send_response(403)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self._safe_write(b"Forbidden: host not allowed")
+            except Exception:
+                pass
+            return False
+        # 2. Rate limit
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            try:
+                self.send_response(429)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Retry-After", str(_RATE_LIMIT_WINDOW))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self._safe_write(b"Rate limit exceeded")
+            except Exception:
+                pass
+            return False
+        # 3. Auth token (skip for HTML page so user can login)
+        path = urlparse(self.path).path
+        if path == "/" or path == "/index.html":
+            return True  # HTML served to everyone (token prompt in JS)
+        if path == "/api/auth/login":
+            return True  # login endpoint
+        # All other /api/* require token
+        if path.startswith("/api/"):
+            token = _get_or_create_token()
+            auth = self.headers.get("Authorization", "")
+            cookie = self.headers.get("Cookie", "")
+            # Check Bearer header
+            if auth.startswith("Bearer "):
+                provided = auth[7:].strip()
+            # Check cookie
+            elif "hermes_token=" in cookie:
+                provided = cookie.split("hermes_token=")[1].split(";")[0].strip()
+            else:
+                provided = ""
+            if not provided or not hmac.compare_digest(provided, token):
+                try:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self._safe_write(b'{"error":"unauthorized","message":"Token required. GET / to login."}')
+                except Exception:
+                    pass
+                return False
+        return True
 
     def do_OPTIONS(self):
         """CORS preflight."""
@@ -1631,10 +1839,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if not self._check_security():
+            return
         try:
             path = urlparse(self.path).path
             if path == "/" or path == "/index.html":
                 self._send_html(_build_html())
+            elif path == "/api/auth/login":
+                # Login: returns token if user knows it (or generates new on first run)
+                # Token is printed to terminal on server start
+                self._send_json({"needs_token": True, "hint": "Xem terminal để lấy token"})
             elif path == "/api/status":
                 self._send_json(_get_status())
             elif path == "/api/providers":
@@ -1664,11 +1878,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
+        if not self._check_security():
+            return
         path = urlparse(self.path).path
+        # Limit request body size (10 MB max)
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except Exception:
             length = 0
+        if length > 10 * 1024 * 1024:
+            self._send_json({"error": "Body too large (max 10MB)"}, 413)
+            return
         try:
             if path == "/api/upload":
                 self._handle_upload()
@@ -1849,15 +2069,22 @@ def _health_check() -> dict:
     return health
 
 
-def run_server(port: int = 8788) -> None:
+def run_server(port: int = 8788, host: str = "127.0.0.1") -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     UNIFIED_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"═══ Hermes-Omni Dashboard v5 ═══", flush=True)
-    print(f"  URL:      http://localhost:{port}", flush=True)
+    # Generate auth token BEFORE printing banner
+    token = _get_or_create_token()
+
+    print(f"═══ Hermes-Omni Dashboard v6 ═══", flush=True)
+    print(f"  URL:      http://{host}:{port}", flush=True)
+    print(f"  Bind:     {host} (chỉ localhost — an toàn)", flush=True)
     print(f"  Hermes:   {HERMES_HOME}", flush=True)
     print(f"  Repo:     {REPO_ROOT}", flush=True)
     print(f"  Uploads:  {UPLOAD_DIR}", flush=True)
+    print(f"  Token:    {token}", flush=True)
+    print(f"  Token file: {_AUTH_TOKEN_FILE}", flush=True)
+    print(f"  ⚠ Truy cập từ outside localhost cần SSH tunnel/Tailscale", flush=True)
 
     # Pre-flight check
     print(f"\n  Pre-flight check:", flush=True)
@@ -1884,7 +2111,7 @@ def run_server(port: int = 8788) -> None:
     actual_port = None
     for p in ports_to_try:
         try:
-            server = _StableHTTPServer(("0.0.0.0", p), DashboardHandler)
+            server = _StableHTTPServer((host, p), DashboardHandler)
             actual_port = p
             break
         except OSError as e:
@@ -1896,8 +2123,9 @@ def run_server(port: int = 8788) -> None:
     if actual_port != port:
         print(f"  → Đổi sang port {actual_port}", flush=True)
 
-    print(f"  ▶ Server chạy tại: http://localhost:{actual_port}", flush=True)
-    print(f"  ▶ Health: http://localhost:{actual_port}/api/health", flush=True)
+    print(f"\n  ▶ Server chạy tại: http://{host}:{actual_port}", flush=True)
+    print(f"  ▶ Token: {token}", flush=True)
+    print(f"  ▶ Mở browser → nhập token khi được hỏi", flush=True)
     print(f"  Ctrl+C để dừng\n", flush=True)
 
     try:
@@ -1909,7 +2137,17 @@ def run_server(port: int = 8788) -> None:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Hermes-Omni Dashboard v5")
+    parser = argparse.ArgumentParser(description="Hermes-Omni Dashboard v6")
     parser.add_argument("--port", type=int, default=8788)
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Bind host (default 127.0.0.1, dùng 0.0.0.0 để mở ra mạng — CẢNH BÁO)")
+    parser.add_argument("--new-token", action="store_true",
+                        help="Tạo token mới (vô hiệu token cũ)")
     args = parser.parse_args()
-    run_server(port=args.port)
+    if args.new_token:
+        try:
+            _AUTH_TOKEN_FILE.unlink()
+        except Exception:
+            pass
+        print("✓ Token cũ đã xóa. Token mới sẽ được tạo khi server khởi động.", flush=True)
+    run_server(port=args.port, host=args.host)
