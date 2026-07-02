@@ -354,7 +354,7 @@ def _get_logs() -> list:
 _chat_lock = threading.Lock()
 
 
-def _send_to_agent(message: str, timeout: int = 120) -> dict:
+def _send_to_agent(message: str, timeout: int = 90) -> dict:
     """Run one-shot through the real Hermes agent via subprocess.
 
     Using subprocess (not in-process) so:
@@ -384,6 +384,9 @@ def _send_to_agent(message: str, timeout: int = 120) -> dict:
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()
 
+        # Log start
+        start = time.time()
+        print(f"[chat] start: {message[:80]!r}", flush=True)
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "hermes_cli.main", "-z", message, "--yolo"],
@@ -392,8 +395,10 @@ def _send_to_agent(message: str, timeout: int = 120) -> dict:
                 cwd=str(REPO_ROOT),
                 env=env,
             )
+            elapsed = time.time() - start
             response = (proc.stdout or "").strip()
             err_text = (proc.stderr or "").strip()
+            print(f"[chat] done in {elapsed:.1f}s, rc={proc.returncode}, out={len(response)}B, err={len(err_text)}B", flush=True)
             if proc.returncode == 0 and response:
                 # Filter out known non-response lines
                 lines = [l for l in response.splitlines() if l.strip()
@@ -401,17 +406,20 @@ def _send_to_agent(message: str, timeout: int = 120) -> dict:
                          and not l.startswith("Calling tool")
                          and not l.startswith("Tool output")]
                 cleaned = "\n".join(lines).strip() if lines else response
-                return {"success": True, "response": cleaned}
+                return {"success": True, "response": cleaned, "elapsed": round(elapsed, 1)}
             if response:
-                return {"success": True, "response": response, "warning": err_text[:200] if err_text else None}
+                return {"success": True, "response": response, "warning": err_text[:200] if err_text else None, "elapsed": round(elapsed, 1)}
             return {
                 "success": False,
                 "error": (err_text[:300] if err_text else f"Agent exit code {proc.returncode}"),
             }
         except subprocess.TimeoutExpired:
-            return {"success": False, "error": f"Agent timeout sau {timeout}s — thử lại với câu ngắn hơn hoặc tắt tools."}
+            elapsed = time.time() - start
+            print(f"[chat] TIMEOUT after {elapsed:.1f}s", flush=True)
+            return {"success": False, "error": f"Agent timeout sau {int(elapsed)}s — thử lại với câu ngắn hơn hoặc tắt tools (mode Fast)."}
         except Exception as exc:
             tb = traceback.format_exc()
+            print(f"[chat] ERROR: {type(exc).__name__}: {exc}", flush=True)
             return {"success": False, "error": f"{type(exc).__name__}: {exc}", "traceback": tb[-800:]}
 
 
@@ -1457,38 +1465,80 @@ setInterval(loadLogs, 5000);
 # ─── HTTP handler ───────────────────────────────────────────────────────────
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = 300  # 5 min for long chat requests
+
+    def _safe_write(self, data: bytes) -> bool:
+        """Write to wfile, swallowing BrokenPipeError / ConnectionResetError
+        when the client closes early."""
+        try:
+            self.wfile.write(data)
+            return True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return False
+        except Exception:
+            return False
+
+    def do_OPTIONS(self):
+        """CORS preflight."""
+        try:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception:
+            pass
+
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/" or path == "/index.html":
-            self._send_html(_build_html())
-        elif path == "/api/status":
-            self._send_json(_get_status())
-        elif path == "/api/providers":
-            self._send_json(_get_providers())
-        elif path == "/api/config":
-            self._send_json(_get_config())
-        elif path == "/api/skills":
-            self._send_json(_scan_skills())
-        elif path == "/api/costs":
-            self._send_json(_get_costs())
-        elif path == "/api/logs":
-            self._send_json(_get_logs())
-        elif path == "/api/current-config":
-            self._send_json(_get_current_config())
-        elif path.startswith("/api/download/"):
-            self._serve_file(path[len("/api/download/"):])
-        else:
-            self._send_json({"error": "not found"}, 404)
+        try:
+            path = urlparse(self.path).path
+            if path == "/" or path == "/index.html":
+                self._send_html(_build_html())
+            elif path == "/api/status":
+                self._send_json(_get_status())
+            elif path == "/api/providers":
+                self._send_json(_get_providers())
+            elif path == "/api/config":
+                self._send_json(_get_config())
+            elif path == "/api/skills":
+                self._send_json(_scan_skills())
+            elif path == "/api/costs":
+                self._send_json(_get_costs())
+            elif path == "/api/logs":
+                self._send_json(_get_logs())
+            elif path == "/api/current-config":
+                self._send_json(_get_current_config())
+            elif path.startswith("/api/download/"):
+                self._serve_file(path[len("/api/download/"):])
+            else:
+                self._send_json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # Client gone — nothing to do
+        except Exception as e:
+            try:
+                self._send_json({"error": f"server: {type(e).__name__}: {e}"}, 500)
+            except Exception:
+                pass
 
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except Exception:
+            length = 0
+        try:
             if path == "/api/upload":
                 self._handle_upload()
                 return
             body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-            data = json.loads(body) if body else {}
+            try:
+                data = json.loads(body) if body else {}
+            except Exception:
+                data = {}
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
         except Exception:
             data = {}
 
@@ -1504,13 +1554,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/action/add-provider": lambda: _action_add_provider(data),
             "/api/action/clear-chat": lambda: _action_clear_chat(data),
         }
-        if path in routes:
-            try:
-                self._send_json(routes[path]())
-            except Exception as e:
-                self._send_json({"success": False, "error": f"{type(e).__name__}: {e}"}, 500)
-        else:
-            self._send_json({"error": "unknown action"}, 404)
+        try:
+            if path in routes:
+                try:
+                    self._send_json(routes[path]())
+                except Exception as e:
+                    self._send_json({"success": False, "error": f"{type(e).__name__}: {e}"}, 500)
+            else:
+                self._send_json({"error": "unknown action"}, 404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # client gone
 
     def _handle_upload(self):
         ct = self.headers.get("Content-Type", "")
@@ -1519,7 +1572,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length)
             boundary = ct.split("boundary=")[1].encode()
             parts = body.split(b"--" + boundary)
@@ -1544,6 +1597,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ce = len(part)
                 file_data = part[cs:ce]
                 safe = "".join(c for c in filename if c.isalnum() or c in "._-")
+                if not safe:
+                    safe = "upload_" + str(int(time.time()))
                 fp = UPLOAD_DIR / safe
                 fp.write_bytes(file_data)
                 saved.append({"name": filename, "size": len(file_data), "path": str(fp)})
@@ -1552,37 +1607,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"success": False, "error": "No files found"})
         except Exception as e:
-            self._send_json({"success": False, "error": str(e)})
+            try:
+                self._send_json({"success": False, "error": str(e)})
+            except Exception:
+                pass
 
     def _serve_file(self, filename: str):
         fp = UPLOAD_DIR / filename
         if not fp.exists():
             self._send_json({"error": "File not found"}, 404)
             return
-        data = fp.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            data = fp.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self._safe_write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def _send_html(self, html: str):
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self._safe_write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def _send_json(self, data, code: int = 200):
-        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self._safe_write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def log_message(self, *args):
         pass
